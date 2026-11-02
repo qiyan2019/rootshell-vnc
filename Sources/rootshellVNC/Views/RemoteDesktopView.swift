@@ -48,6 +48,8 @@ public struct RemoteDesktopView: View {
     @State private var viewport = RemoteViewportState()
     @State private var viewportPanningMode: RemoteViewportPanningMode
     @State private var pointerMode: RemotePointerMode
+    /// 记住上次是否已越过适配比例，避免捏合过程中重复回调。
+    @State private var viewportZoom = ViewportZoomChange()
     @State private var keyboardActive = false
     @State private var confirmPasswordSend = false
     @State private var curtainPromptPresented = false
@@ -76,6 +78,8 @@ public struct RemoteDesktopView: View {
     private let showsBuiltInControls: Bool
     /// 非 nil 时由宿主驱动指针模式，菜单写入也走这个绑定。
     private let externalPointerMode: Binding<RemotePointerMode>?
+    /// 相对适配比例放大时为 true，回到适配时为 false。只在翻转时调用。
+    private let onViewportZoomChange: (@MainActor (Bool) -> Void)?
     private let pointerSpeed: Double
     /// On-screen height of the locally drawn pointer, in view points. The
     /// host owns this because only it knows the display the desktop is being
@@ -106,7 +110,8 @@ public struct RemoteDesktopView: View {
         hostOwnsRecoveryChrome: Bool = false,
         brightnessGain: Double = 1.0,
         showsBuiltInControls: Bool = true,
-        pointerMode: Binding<RemotePointerMode>? = nil
+        pointerMode: Binding<RemotePointerMode>? = nil,
+        onViewportZoomChange: (@MainActor (Bool) -> Void)? = nil
     ) {
         self.init(
             session: session,
@@ -124,6 +129,7 @@ public struct RemoteDesktopView: View {
             brightnessGain: brightnessGain,
             showsBuiltInControls: showsBuiltInControls,
             pointerMode: pointerMode,
+            onViewportZoomChange: onViewportZoomChange,
             hudMenuExtras: nil)
     }
 
@@ -149,6 +155,7 @@ public struct RemoteDesktopView: View {
         brightnessGain: Double = 1.0,
         showsBuiltInControls: Bool = true,
         pointerMode: Binding<RemotePointerMode>? = nil,
+        onViewportZoomChange: (@MainActor (Bool) -> Void)? = nil,
         @ViewBuilder hudMenuExtras: () -> MenuExtras
     ) {
         self.init(
@@ -167,6 +174,7 @@ public struct RemoteDesktopView: View {
             brightnessGain: brightnessGain,
             showsBuiltInControls: showsBuiltInControls,
             pointerMode: pointerMode,
+            onViewportZoomChange: onViewportZoomChange,
             hudMenuExtras: AnyView(hudMenuExtras()))
     }
 
@@ -186,6 +194,7 @@ public struct RemoteDesktopView: View {
         brightnessGain: Double,
         showsBuiltInControls: Bool,
         pointerMode: Binding<RemotePointerMode>?,
+        onViewportZoomChange: (@MainActor (Bool) -> Void)?,
         hudMenuExtras: AnyView?
     ) {
         self.session = session
@@ -193,6 +202,7 @@ public struct RemoteDesktopView: View {
         self.hudMenuExtras = hudMenuExtras
         self.showsBuiltInControls = showsBuiltInControls
         self.externalPointerMode = pointerMode
+        self.onViewportZoomChange = onViewportZoomChange
         self._viewportPanningMode = State(initialValue: initialViewportPanningMode)
         self._pointerMode = State(initialValue: initialPointerMode)
         self.pointerSpeed = pointerSpeed
@@ -372,6 +382,9 @@ public struct RemoteDesktopView: View {
             if keyboardActive != requested {
                 keyboardActive = requested
             }
+        }
+        .onChange(of: viewport.scale) { _, scale in
+            reportViewportZoom(scale)
         }
         #if canImport(UIKit)
         .background {
@@ -719,6 +732,15 @@ public struct RemoteDesktopView: View {
         } else {
             pointerMode = mode
         }
+    }
+
+    /// 缩放相对适配比例翻转时通知宿主。没给回调，或比例没跨过适配线，就什么都不做。
+    private func reportViewportZoom(_ scale: CGFloat) {
+        guard let onViewportZoomChange else { return }
+        var zoom = viewportZoom
+        guard let zoomed = zoom.observe(scale: scale) else { return }
+        viewportZoom = zoom
+        onViewportZoomChange(zoomed)
     }
 
     private func requestPasswordSend() {
