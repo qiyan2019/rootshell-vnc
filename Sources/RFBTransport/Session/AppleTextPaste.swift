@@ -43,6 +43,8 @@ struct AppleTextPasteState: Sendable {
 
     private(set) var savedScrap: Data?
     private var requestPending = false
+
+    var hasPendingText: Bool { !queue.isEmpty }
     /// 粘贴键已经把在等的文字发出去了。随后到达的 type-11 是这次请求的旧快照，不能再存。
     private var ignoreOutstandingScrap = false
     private var queue: [String] = []
@@ -94,6 +96,20 @@ struct AppleTextPasteState: Sendable {
         requestPending = false
         savedScrap = nil
         return [.send(try AppleTextPaste.payload(text: merged, savedScrap: nil))]
+    }
+
+    /// 应答超时。把还在等的文字直接贴出去，不回发。随后到达的 type-31 是这次
+    /// 请求的旧快照，不再发送，也不记成新快照。
+    mutating func flushSkippingRestore() throws -> [Step] {
+        guard !queue.isEmpty else { return [] }
+        let merged = queue.joined()
+        let payload = try AppleTextPaste.payload(text: merged, savedScrap: nil)
+        queue.removeAll()
+        if requestPending {
+            ignoreOutstandingScrap = true
+        }
+        requestPending = false
+        return [.send(payload)]
     }
 
     /// 记下服务端 scrap 的原始字节。队列里的定稿文字用这段字节回发。

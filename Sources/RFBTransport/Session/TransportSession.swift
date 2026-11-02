@@ -743,6 +743,11 @@ public actor TransportSession {
     private var appleClipboardRequestID: UInt32 = 0
     /// 最近一条服务端 type-31 的原始字节，供定稿文字粘贴后原样回发。
     private var textPaste = AppleTextPasteState()
+    /// `pasteCommittedText` 在等队列清空。断开和超时都必须 resume，不能漏。
+    private var textPasteDrainWaiter: CheckedContinuation<Void, Error>?
+    private var textPasteDrainTimeout: Task<Void, Never>?
+    /// 读循环正在把这次应答对应的粘贴写到线上。超时任务不能抢先放行。
+    private var textPasteReplyInFlight = false
     private var appleSharedClipboardEnabled = false
     /// A regular RFB server may receive SetDesktopSize only after it sends an
     /// ExtendedDesktopSize rectangle. Retain that screen identity and any
@@ -774,6 +779,12 @@ public actor TransportSession {
     /// the live view's request a short opportunity to replace the staged size
     /// before issuing the first display command.
     private static let initialVirtualDisplayCoalescingDelay = Duration.milliseconds(350)
+    /// 定稿粘贴发出 type-11 之后最多再等这么久。
+    ///
+    /// 应答和帧更新走同一条控制通道，在读循环里收，不经过输入泵。1 秒盖住一次
+    /// 往返加上服务端打包当前剪贴板；再久，紧跟着的回车会像没按下去。到点就
+    /// 直接贴并跳过恢复，和队列超过 32 段是同一条「不等了」的路。
+    private static let textPasteSnapshotTimeout = Duration.seconds(1)
     /// Non-wheel pointer buttons currently held, preserved across fallback
     /// wheel press/release pairs just like the native client.
     private var pointerButtonMask: UInt8 = 0
@@ -1142,8 +1153,10 @@ public actor TransportSession {
 
     /// 把定稿文字贴到远端：packed scrap、Cmd+V，再原样回发之前的 scrap。
     ///
-    /// 没有能力位 31 时返回 false，调用方逐字发键。还没有服务端 scrap 时先发一次
-    /// type-11，文字先排队，应答到达后再粘贴并回发原始字节。不记录剪贴板内容。
+    /// 没有能力位 31 时返回 false，调用方逐字发键。还没有能用的 scrap 时先发一次
+    /// type-11，文字先排队。这个函数要等到粘贴字节写出去才返回，输入泵因此不会
+    /// 把后面的按键排到文字前面。应答在 ``textPasteSnapshotTimeout`` 内没到，就
+    /// 直接贴并跳过恢复。断开连接时放行。不记录剪贴板内容。
     public func pasteCommittedText(_ text: String) async throws -> Bool {
         guard Self.shouldUseApplePackedClipboard(
             capabilities: appleServerCapabilities) else {
@@ -1152,6 +1165,7 @@ public actor TransportSession {
         let steps = try textPaste.submit(
             text, useCachedScrap: appleSharedClipboardEnabled)
         try await performTextPaste(steps)
+        try await waitForTextPasteToSettle()
         return true
     }
 
@@ -1557,6 +1571,7 @@ public actor TransportSession {
     public func disconnect() async {
         log.info("Disconnecting")
         isDisconnecting = true
+        finishTextPasteDrain(VNCProtocolError.connectionClosed)
         terminalDisconnectHandled = true
         readTask?.cancel()
         readTask = nil
@@ -2210,6 +2225,7 @@ public actor TransportSession {
     ) async {
         guard !isDisconnecting, !terminalDisconnectHandled else { return }
         terminalDisconnectHandled = true
+        finishTextPasteDrain(error)
         await logDisconnectSummary(error, origin: origin)
         readTask?.cancel()
         appleAutoUpdateRefreshTask?.cancel()
@@ -3843,13 +3859,85 @@ public actor TransportSession {
         }
     }
 
-    private func retainPackedScrap(_ wire: Data) async {
-        let steps = textPaste.receive(wire)
+    /// type-11 已经发出、文字还在队列里时挂起。读循环收到 type-31 后
+    /// ``retainPackedScrap`` 把粘贴写出去再放行。这条读路径不经过
+    /// `VNCSession` 的输入泵，所以泵停在这里等不会和应答互相卡住。
+    private func waitForTextPasteToSettle() async throws {
+        guard textPaste.hasPendingText else { return }
+        guard !isDisconnecting else {
+            throw VNCProtocolError.connectionClosed
+        }
+        try await withCheckedThrowingContinuation { continuation in
+            precondition(textPasteDrainWaiter == nil)
+            textPasteDrainWaiter = continuation
+            textPasteDrainTimeout?.cancel()
+            textPasteDrainTimeout = Task { [weak self] in
+                try? await Task.sleep(for: Self.textPasteSnapshotTimeout)
+                guard !Task.isCancelled, let self else { return }
+                await self.flushTextPasteAfterTimeout()
+            }
+        }
+    }
+
+    private func flushTextPasteAfterTimeout() async {
+        guard textPasteDrainWaiter != nil else { return }
+        guard !isDisconnecting else {
+            finishTextPasteDrain(VNCProtocolError.connectionClosed)
+            return
+        }
+        // 应答已经把队列取走、粘贴还在写的时候，放行留给那次发送结束。
+        guard textPaste.hasPendingText else {
+            if !textPasteReplyInFlight {
+                finishTextPasteDrain(nil)
+            }
+            return
+        }
         do {
+            let steps = try textPaste.flushSkippingRestore()
             try await performTextPaste(steps)
+            finishTextPasteDrain(nil)
         } catch {
             log.warning(
                 "Failed to paste committed text: \(error.localizedDescription)")
+            finishTextPasteDrain(error)
+        }
+    }
+
+    private func finishTextPasteDrain(_ error: Error?) {
+        textPasteDrainTimeout?.cancel()
+        textPasteDrainTimeout = nil
+        guard let waiter = textPasteDrainWaiter else { return }
+        textPasteDrainWaiter = nil
+        if let error {
+            waiter.resume(throwing: error)
+        } else {
+            waiter.resume()
+        }
+    }
+
+    private func retainPackedScrap(_ wire: Data) async {
+        let hadPending = textPaste.hasPendingText
+        let steps = textPaste.receive(wire)
+        if hadPending {
+            textPasteReplyInFlight = true
+        }
+        do {
+            try await performTextPaste(steps)
+            if hadPending {
+                textPasteReplyInFlight = false
+                if !textPaste.hasPendingText {
+                    finishTextPasteDrain(nil)
+                }
+            }
+        } catch {
+            if hadPending {
+                textPasteReplyInFlight = false
+            }
+            log.warning(
+                "Failed to paste committed text: \(error.localizedDescription)")
+            if hadPending {
+                finishTextPasteDrain(error)
+            }
         }
     }
 

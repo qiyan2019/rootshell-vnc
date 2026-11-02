@@ -76,6 +76,57 @@ final class VNCTextInputTests: XCTestCase {
         XCTAssertEqual(order, ["key"])
     }
 
+    func testNewlinePiecesStayOutOfTheCommitHook() {
+        let crlf = "\r\n".first!
+        XCTAssertEqual(crlf.unicodeScalars.count, 2)
+        XCTAssertTrue(crlf.isNewline)
+        XCTAssertEqual(
+            KeyboardInputHandler.keysymForCharacter(crlf),
+            KeyboardInputHandler.keysymReturn)
+
+        XCTAssertEqual(SoftKeyboardInsert.pieces(in: "a\nb"), [
+            .text("a"), .newline("\n"), .text("b"),
+        ])
+        XCTAssertEqual(SoftKeyboardInsert.pieces(in: "\r\n"), [
+            .newline(crlf),
+        ])
+        XCTAssertEqual(SoftKeyboardInsert.pieces(in: "a\r\nb🙂"), [
+            .text("a"), .newline(crlf), .text("b🙂"),
+        ])
+        XCTAssertEqual(SoftKeyboardInsert.pieces(in: "🙂"), [.text("🙂")])
+        XCTAssertEqual(SoftKeyboardInsert.pieces(in: ""), [])
+
+        var order: [String] = []
+        for piece in SoftKeyboardInsert.pieces(in: "a\nb") {
+            switch piece {
+            case .text(let text):
+                VNCSoftKeyboardCommit.deliver(text, hook: { chunk in
+                    order.append("hook \(chunk)")
+                    return true
+                }, send: { _ in
+                    order.append("keystroke")
+                })
+            case .newline:
+                UpcomingKeyPreparation.perform({ order.append("prepare") }) {
+                    order.append("return")
+                }
+            }
+        }
+        XCTAssertEqual(order, ["hook a", "prepare", "return", "hook b"])
+    }
+
+    func testCommitHookReceivesEmojiIntact() {
+        var seen: String?
+        var sent = ""
+        VNCSoftKeyboardCommit.deliver("🙂", hook: { text in
+            seen = text
+            return true
+        }, send: { sent.append($0) })
+        XCTAssertEqual(seen, "🙂")
+        XCTAssertEqual(seen?.unicodeScalars.count, 1)
+        XCTAssertEqual(sent, "")
+    }
+
     func testPasteTextIsAnOrderingBarrier() {
         var queue = SessionInputQueue()
         queue.enqueue(.pasteText("hi"))
@@ -199,6 +250,66 @@ final class VNCTextInputViewTests: XCTestCase {
         view.insertText("\n")
         XCTAssertEqual(prepared, 1)
         XCTAssertEqual(log.events.map(\.keysym).first, KeyboardInputHandler.keysymReturn)
+    }
+
+    func testNewlineIsReturnBetweenCommitHooks() {
+        let log = EventLog()
+        let capture = VNCKeyboardCapture()
+        var seen: [String] = []
+        var order: [String] = []
+        capture.onCommitText = { text in
+            seen.append(text)
+            order.append("hook")
+            return true
+        }
+        capture.onPrepareForKey = { order.append("prepare") }
+        let view = makeView(capture: capture, log: log)
+        view.insertText("a\nb")
+        XCTAssertEqual(seen, ["a", "b"])
+        XCTAssertEqual(order, ["hook", "prepare", "hook"])
+        XCTAssertEqual(log.events.map(\.keysym), [
+            KeyboardInputHandler.keysymReturn,
+            KeyboardInputHandler.keysymReturn,
+        ])
+        XCTAssertEqual(log.events.map(\.downFlag), [true, false])
+    }
+
+    func testCarriageReturnNewlineIsOneReturnAndSkipsTheHook() {
+        let log = EventLog()
+        let capture = VNCKeyboardCapture()
+        var seen: [String] = []
+        capture.onCommitText = { text in
+            seen.append(text)
+            return true
+        }
+        var prepared = 0
+        capture.onPrepareForKey = { prepared += 1 }
+        let view = makeView(capture: capture, log: log)
+        view.insertText("\r\n")
+        XCTAssertTrue(seen.isEmpty)
+        XCTAssertEqual(prepared, 1)
+        XCTAssertEqual(log.events.map(\.keysym), [
+            KeyboardInputHandler.keysymReturn,
+            KeyboardInputHandler.keysymReturn,
+        ])
+    }
+
+    func testReturnStillConsumesStickyModifiersWhenSurroundingTextIsPasted() {
+        let log = EventLog()
+        let capture = VNCKeyboardCapture()
+        var consumed = 0
+        capture.supplementalModifiers = [.command]
+        capture.onSupplementalModifiersConsumed = { consumed += 1 }
+        capture.onCommitText = { _ in true }
+        let view = makeView(capture: capture, log: log)
+        view.insertText("a\nb")
+        XCTAssertEqual(consumed, 1)
+        XCTAssertEqual(log.events.map(\.keysym), [
+            KeyboardInputHandler.keysymSuperL,
+            KeyboardInputHandler.keysymReturn,
+            KeyboardInputHandler.keysymReturn,
+            KeyboardInputHandler.keysymSuperL,
+        ])
     }
 }
 #endif

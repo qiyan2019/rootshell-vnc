@@ -156,7 +156,8 @@ public final class VNCKeyboardCapture {
     /// 软键盘定稿文字。返回 true 表示宿主已处理，视图不再逐字发键。
     ///
     /// 不设置、或返回 false 时，行为和上游 `insertText` 逐字发键一致。
-    /// 退格、回车、方向键、硬件键盘不经过这里。返回 true 时也不消耗粘滞修饰，
+    /// 退格、回车、方向键、硬件键盘不经过这里。`insertText` 会先把换行切成
+    /// Return 键，剩下的文字才进这个钩子。返回 true 时也不消耗粘滞修饰，
     /// 宿主若自己发键，要自己处理 ``supplementalModifiers``。
     @ObservationIgnored
     public var onCommitText: (@MainActor (String) -> Bool)?
@@ -222,6 +223,35 @@ enum UpcomingKeyPreparation {
     ) {
         hook?()
         send()
+    }
+}
+
+/// `insertText` 的分段。换行（含 Swift 里合成一个 `Character` 的 `"\r\n"`）单独成段，
+/// 其余文字保持原顺序拼在一起。
+enum SoftKeyboardInsert: Sendable {
+    enum Piece: Equatable, Sendable {
+        case text(String)
+        case newline(Character)
+    }
+
+    static func pieces(in text: String) -> [Piece] {
+        var pieces: [Piece] = []
+        var buffer = ""
+        for character in text {
+            if character.isNewline {
+                if !buffer.isEmpty {
+                    pieces.append(.text(buffer))
+                    buffer.removeAll(keepingCapacity: true)
+                }
+                pieces.append(.newline(character))
+            } else {
+                buffer.append(character)
+            }
+        }
+        if !buffer.isEmpty {
+            pieces.append(.text(buffer))
+        }
+        return pieces
     }
 }
 

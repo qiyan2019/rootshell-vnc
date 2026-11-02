@@ -996,27 +996,33 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     func insertText(_ text: String) {
-        let send = {
-            let modifiers = self.keyboardCapture.supplementalModifiers
-            var dispatched = false
-            // 钩子只拦软键盘定稿文字。退格、回车、方向键、硬件键盘仍走各自的原路径。
-            VNCSoftKeyboardCommit.deliver(
-                text,
-                hook: self.keyboardCapture.onCommitText
-            ) { character in
-                dispatched = self.keyboardHandler.handleKeyTap(
-                    character,
-                    supplementalModifiers: modifiers) || dispatched
-            }
-            if dispatched, !modifiers.isEmpty {
-                self.keyboardCapture.onSupplementalModifiersConsumed?()
+        let modifiers = self.keyboardCapture.supplementalModifiers
+        var dispatched = false
+        // 换行不进定稿钩子。粘贴档的钩子会返回 true，整段交给它的话回车会被贴进
+        // 文字，而不是按下 Return。一段里夹着换行时，顺序是：前面的文字、
+        // prepare、Return、后面的文字。粘滞修饰仍包住真正发出去的键，整段结束
+        // 才消耗一次。
+        for piece in SoftKeyboardInsert.pieces(in: text) {
+            switch piece {
+            case .text(let chunk):
+                VNCSoftKeyboardCommit.deliver(
+                    chunk,
+                    hook: self.keyboardCapture.onCommitText
+                ) { character in
+                    dispatched = self.keyboardHandler.handleKeyTap(
+                        character,
+                        supplementalModifiers: modifiers) || dispatched
+                }
+            case .newline:
+                UpcomingKeyPreparation.perform(self.keyboardCapture.onPrepareForKey) {
+                    dispatched = self.keyboardHandler.handleKeysymTap(
+                        KeyboardInputHandler.keysymReturn,
+                        supplementalModifiers: modifiers) || dispatched
+                }
             }
         }
-        if text.contains(where: { $0 == "\n" || $0 == "\r" }) {
-            UpcomingKeyPreparation.perform(
-                keyboardCapture.onPrepareForKey, then: send)
-        } else {
-            send()
+        if dispatched, !modifiers.isEmpty {
+            self.keyboardCapture.onSupplementalModifiersConsumed?()
         }
     }
 

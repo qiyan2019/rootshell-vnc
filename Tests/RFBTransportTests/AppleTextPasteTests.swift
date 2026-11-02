@@ -163,6 +163,42 @@ final class AppleTextPasteTests: XCTestCase {
         XCTAssertEqual(state.savedScrap, late)
     }
 
+    func testPackedTextRoundTripsEmoji() throws {
+        let message = try AppleClipboardProtocol.packedTextMessage("🙂")
+        let start = message.startIndex
+        let uncompressed = try XCTUnwrap(
+            AppleClipboardProtocol.uint32BE(message, at: start + 8))
+        let compressedLength = try XCTUnwrap(
+            AppleClipboardProtocol.uint32BE(message, at: start + 12))
+        let compressed = Data(message.dropFirst(
+            AppleClipboardProtocol.packedScrapHeaderSize))
+        XCTAssertEqual(compressed.count, Int(compressedLength))
+        let text = try AppleClipboardProtocol.unpackText(
+            compressed: compressed,
+            uncompressedSize: Int(uncompressed))
+        XCTAssertEqual(text, "🙂")
+    }
+
+    func testFlushSkippingRestoreDropsTheLateSnapshot() throws {
+        var state = AppleTextPasteState()
+        XCTAssertEqual(
+            try state.submit("hi", useCachedScrap: false),
+            [.requestSnapshot])
+        XCTAssertTrue(state.hasPendingText)
+
+        let steps = try state.flushSkippingRestore()
+        let packed = try AppleClipboardProtocol.packedTextMessage("hi")
+        XCTAssertEqual(steps, [.send(packed + AppleTextPaste.commandVKeys())])
+        XCTAssertFalse(state.hasPendingText)
+
+        let late = try AppleClipboardProtocol.packedTextMessage("old")
+        XCTAssertEqual(state.receive(late), [])
+        XCTAssertNil(state.savedScrap)
+        XCTAssertEqual(
+            try state.submit("z", useCachedScrap: false),
+            [.requestSnapshot])
+    }
+
     func testCapabilityBit31MatchesPackedScrapCommand() {
         var bitmap = Data(repeating: 0, count: 16)
         bitmap[3] = 0x01
@@ -179,5 +215,161 @@ final class AppleTextPasteTests: XCTestCase {
         let without = AppleServerCapabilities(serverInitNameField: empty)
         XCTAssertFalse(TransportSession.shouldUseApplePackedClipboard(capabilities: without))
         XCTAssertTrue(TransportSession.shouldUseApplePackedClipboard(capabilities: capabilities))
+    }
+
+    func testCommittedPasteHitsTheWireBeforeTheFollowingKey() async throws {
+        let harness = try await connectApplePackedScrap()
+        let baseline = await harness.connection.sentBytes().count
+        let saved = try AppleClipboardProtocol.packedTextMessage("old")
+        let paste = Task { try await harness.session.pasteCommittedText("hi") }
+        let request = AppleClipboardProtocol.requestMessage(requestID: 1)
+        let sawRequest = await waitUntil {
+            let sent = await harness.connection.sentBytes()
+            return sent.dropFirst(baseline).range(of: request) != nil
+        }
+        XCTAssertTrue(sawRequest)
+
+        await harness.connection.enqueueServerBytes(saved)
+        let pasted = try await paste.value
+        XCTAssertTrue(pasted)
+        let key = ClientMessage.keyEvent(downFlag: true, key: 0xFF0D).serialize()
+        try await harness.session.sendKeyEvent(downFlag: true, key: 0xFF0D)
+
+        let body = Data((await harness.connection.sentBytes()).dropFirst(baseline))
+        let payload = try AppleTextPaste.payload(text: "hi", savedScrap: saved)
+        let requestAt = try XCTUnwrap(body.range(of: request))
+        let payloadAt = try XCTUnwrap(body.range(of: payload))
+        let keyAt = try XCTUnwrap(body.range(of: key))
+        XCTAssertEqual(requestAt.upperBound, payloadAt.lowerBound)
+        XCTAssertEqual(payloadAt.upperBound, keyAt.lowerBound)
+        await harness.session.disconnect()
+    }
+
+    func testPasteSnapshotTimeoutSkipsRestoreAndIgnoresTheLateReply() async throws {
+        let harness = try await connectApplePackedScrap()
+        let baseline = await harness.connection.sentBytes().count
+        let pasted = try await harness.session.pasteCommittedText("hi")
+        XCTAssertTrue(pasted)
+        let key = ClientMessage.keyEvent(downFlag: true, key: 0xFF0D).serialize()
+        try await harness.session.sendKeyEvent(downFlag: true, key: 0xFF0D)
+
+        let body = Data((await harness.connection.sentBytes()).dropFirst(baseline))
+        let request = AppleClipboardProtocol.requestMessage(requestID: 1)
+        let payload = try AppleTextPaste.payload(text: "hi", savedScrap: nil)
+        let requestAt = try XCTUnwrap(body.range(of: request))
+        let payloadAt = try XCTUnwrap(body.range(of: payload))
+        let keyAt = try XCTUnwrap(body.range(of: key))
+        XCTAssertEqual(requestAt.upperBound, payloadAt.lowerBound)
+        XCTAssertEqual(payloadAt.upperBound, keyAt.lowerBound)
+
+        let frozen = await harness.connection.sentBytes()
+        let late = try AppleClipboardProtocol.packedTextMessage("old")
+        let clipboard = Task { () -> Bool in
+            for await event in harness.session.events {
+                if case .clipboardText = event { return true }
+            }
+            return false
+        }
+        await harness.connection.enqueueServerBytes(late)
+        let sawClipboard = await withTimeout(seconds: 2) { await clipboard.value }
+        let afterLateReply = await harness.connection.sentBytes()
+        XCTAssertEqual(sawClipboard, true)
+        XCTAssertEqual(afterLateReply, frozen)
+        await harness.session.disconnect()
+    }
+
+    func testDisconnectWhileWaitingForPasteDoesNotHang() async throws {
+        let harness = try await connectApplePackedScrap()
+        let baseline = await harness.connection.sentBytes().count
+        let paste = Task { () -> Bool in
+            do {
+                return try await harness.session.pasteCommittedText("hi")
+            } catch {
+                return false
+            }
+        }
+        let request = AppleClipboardProtocol.requestMessage(requestID: 1)
+        let sawRequest = await waitUntil {
+            let sent = await harness.connection.sentBytes()
+            return sent.dropFirst(baseline).range(of: request) != nil
+        }
+        XCTAssertTrue(sawRequest)
+        await harness.session.disconnect()
+        let finished = await withTimeout(seconds: 2) { await paste.value }
+        XCTAssertNotNil(finished)
+    }
+
+    private func connectApplePackedScrap() async throws -> (
+        session: TransportSession,
+        connection: ScriptedRFBConnection
+    ) {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(applePackedScrapServerInit())
+        await connection.enqueueServerBytes(script)
+        let session = TransportSession(
+            host: "paste.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.raw],
+            connection: connection)
+        try await session.connect()
+        return (session, connection)
+    }
+
+    private func applePackedScrapServerInit() -> Data {
+        var bitmap = Data(repeating: 0, count: 16)
+        bitmap[3] = 0x01
+        var field = Data([
+            0x00, 0x00,
+            0x00, 0x00, 0x00, 0x54,
+        ])
+        field.append(bitmap)
+        field.append(Data("paste".utf8))
+
+        var data = Data()
+        data.append(contentsOf: [0x04, 0x00]) // 1024
+        data.append(contentsOf: [0x03, 0x00]) // 768
+        data.append(PixelFormat.bgra8888.wireBytes())
+        let length = UInt32(field.count)
+        data.append(contentsOf: [
+            UInt8((length >> 24) & 0xff),
+            UInt8((length >> 16) & 0xff),
+            UInt8((length >> 8) & 0xff),
+            UInt8(length & 0xff),
+        ])
+        data.append(field)
+        return data
+    }
+
+    private func waitUntil(
+        timeout: Duration = .seconds(2),
+        condition: @escaping @Sendable () async -> Bool
+    ) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if await condition() { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return await condition()
+    }
+
+    private func withTimeout<Result: Sendable>(
+        seconds: Int,
+        _ operation: @escaping @Sendable () async -> Result
+    ) async -> Result? {
+        await withTaskGroup(of: Result?.self) { group in
+            group.addTask { await operation() }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(seconds))
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
     }
 }
