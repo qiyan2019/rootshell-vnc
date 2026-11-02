@@ -66,6 +66,17 @@ final class AppleTextPasteTests: XCTestCase {
         XCTAssertFalse(again.contains(.requestSnapshot))
     }
 
+    func testReplacingPayloadOmitsTheSavedScrap() throws {
+        let saved = Data([0xAB, 0xCD, 0xEF, 0x01])
+        let replacing = try AppleTextPaste.payload(text: "hi", savedScrap: nil)
+        let restoring = try AppleTextPaste.payload(text: "hi", savedScrap: saved)
+        let packed = try AppleClipboardProtocol.packedTextMessage("hi")
+        let keys = AppleTextPaste.commandVKeys()
+        XCTAssertEqual(replacing, packed + keys)
+        XCTAssertEqual(restoring, packed + keys + saved)
+        XCTAssertFalse(replacing.elementsEqual(restoring))
+    }
+
     func testSyncOffRequestsAgainEvenWhenScrapIsSaved() throws {
         var state = AppleTextPasteState()
         XCTAssertEqual(try state.submit("hi", useCachedScrap: false), [.requestSnapshot])

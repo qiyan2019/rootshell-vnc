@@ -19,7 +19,10 @@ enum SessionInputEvent: Sendable, Equatable {
     case clipboard(String)
     case clipboardRequest
     /// 定稿文字走剪贴板粘贴。和按键、剪贴板消息一样是顺序屏障，不与指针合并。
+    /// 贴完会把 Mac 原来的剪贴板回发。
     case pasteText(String)
+    /// 粘贴键：写入远端剪贴板并 Cmd+V，不回发原来的内容。
+    case pasteDeviceText(String)
     case sharedClipboard(Bool)
     case curtain(enabled: Bool, message: String)
 }

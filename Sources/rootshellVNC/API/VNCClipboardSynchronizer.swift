@@ -149,6 +149,8 @@ public final class VNCClipboardSynchronizer {
     private let clipboardChangeNotification: Notification.Name?
     @ObservationIgnored
     private let clipboardChangeObject: Any?
+    @ObservationIgnored
+    private let now: () -> Date
 
     @ObservationIgnored
     private weak var session: VNCSession?
@@ -184,6 +186,12 @@ public final class VNCClipboardSynchronizer {
     private var applicationIsActive = true
     @ObservationIgnored
     private var needsForegroundReconciliation = false
+    /// 刚推出去、还没被连接活过 5 秒确认的那次本地变更。断线落在这个窗口里就收回，连上再发。
+    @ObservationIgnored
+    private var unconfirmedPreviousChangeCount: Int?
+    @ObservationIgnored
+    private var unconfirmedAt: Date?
+    private let unconfirmedSendInterval: TimeInterval = 5
     @ObservationIgnored
     private var invalidated = false
 
@@ -249,7 +257,8 @@ public final class VNCClipboardSynchronizer {
         observesApplicationLifecycle: Bool,
         automaticallyMonitors: Bool,
         clipboardChangeNotification: Notification.Name? = nil,
-        clipboardChangeObject: Any? = nil
+        clipboardChangeObject: Any? = nil,
+        now: @escaping () -> Date = Date.init
     ) {
         self.clipboard = clipboard
         self.canSend = canSend
@@ -262,6 +271,7 @@ public final class VNCClipboardSynchronizer {
         self.automaticallyMonitors = automaticallyMonitors
         self.clipboardChangeNotification = clipboardChangeNotification
         self.clipboardChangeObject = clipboardChangeObject
+        self.now = now
         self.observedLocalChangeCount = clipboard.changeCount
         self.backgroundLocalChangeCount = clipboard.changeCount
 
@@ -291,9 +301,7 @@ public final class VNCClipboardSynchronizer {
     public func sendClipboard() {
         guard !invalidated, canSend(),
               let text = clipboard.readTransferableText() else { return }
-        observedLocalChangeCount = clipboard.changeCount
-        send(text)
-        onTransfer?(.deviceToRemote, text)
+        deliverLocalClipboard(text, previousChangeCount: observedLocalChangeCount)
     }
 
     /// Request the current clipboard from an Apple server, or put the most
@@ -394,9 +402,7 @@ public final class VNCClipboardSynchronizer {
             return
         }
 
-        observedLocalChangeCount = currentChangeCount
-        send(text)
-        onTransfer?(.deviceToRemote, text)
+        deliverLocalClipboard(text, previousChangeCount: observedLocalChangeCount)
     }
 
     func connectionStateDidChange(_ state: VNCConnectionState) {
@@ -410,6 +416,7 @@ public final class VNCClipboardSynchronizer {
             // Flush a local change retained during automatic reconnect.
             localClipboardDidChange()
         case .reconnecting:
+            revertUnconfirmedLocalPushIfRecent()
             clearRemoteCache()
             // Do not establish a local baseline: local changes must remain
             // pending until this same connection comes back.
@@ -419,6 +426,7 @@ public final class VNCClipboardSynchronizer {
             // changes accumulated while the prior connection was closed.
             establishBaseline()
         case .idle, .disconnecting, .disconnected, .failed:
+            revertUnconfirmedLocalPushIfRecent()
             clearRemoteCache()
         }
     }
@@ -445,6 +453,7 @@ public final class VNCClipboardSynchronizer {
         clipboard.writeText(text)
         observedLocalChangeCount = clipboard.changeCount
         isApplyingRemoteText = false
+        clearUnconfirmedLocalPush()
         onTransfer?(.remoteToDevice, text)
     }
 
@@ -452,6 +461,32 @@ public final class VNCClipboardSynchronizer {
         observedLocalChangeCount = clipboard.changeCount
         backgroundLocalChangeCount = clipboard.changeCount
         backgroundRemoteGeneration = remoteGeneration
+        clearUnconfirmedLocalPush()
+    }
+
+    /// 记下这次推送对应的旧变更号。5 秒内连接断了就收回，`.connected` 再由
+    /// `localClipboardDidChange` 重发。没连上的推送不会走到这里。
+    private func deliverLocalClipboard(_ text: String, previousChangeCount: Int) {
+        observedLocalChangeCount = clipboard.changeCount
+        unconfirmedPreviousChangeCount = previousChangeCount
+        unconfirmedAt = now()
+        send(text)
+        onTransfer?(.deviceToRemote, text)
+    }
+
+    private func clearUnconfirmedLocalPush() {
+        unconfirmedPreviousChangeCount = nil
+        unconfirmedAt = nil
+    }
+
+    private func revertUnconfirmedLocalPushIfRecent() {
+        guard let at = unconfirmedAt,
+              let previous = unconfirmedPreviousChangeCount else { return }
+        let recent = now().timeIntervalSince(at) <= unconfirmedSendInterval
+        clearUnconfirmedLocalPush()
+        if recent {
+            observedLocalChangeCount = previous
+        }
     }
 
     private func reconcileAfterForegroundIfPossible() {

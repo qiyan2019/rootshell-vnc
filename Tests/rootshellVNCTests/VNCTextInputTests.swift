@@ -87,6 +87,16 @@ final class VNCTextInputTests: XCTestCase {
             .pasteText("yo"),
         ])
     }
+
+    func testPasteDeviceTextStaysAheadOfTheFollowingKey() {
+        var queue = SessionInputQueue()
+        queue.enqueue(.pasteDeviceText("hi"))
+        queue.enqueue(.key(downFlag: true, keysym: 0x76))
+        XCTAssertEqual(queue.pending, [
+            .pasteDeviceText("hi"),
+            .key(downFlag: true, keysym: 0x76),
+        ])
+    }
 }
 
 #if canImport(UIKit)

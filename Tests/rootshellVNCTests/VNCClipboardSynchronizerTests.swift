@@ -32,6 +32,7 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         setRemoteSharedClipboard: @escaping (Bool) -> Void = { _ in },
         notificationCenter: NotificationCenter = NotificationCenter(),
         clipboardChangeNotification: Notification.Name? = nil,
+        now: @escaping () -> Date = Date.init,
         send: @escaping (String) -> Void
     ) -> VNCClipboardSynchronizer {
         VNCClipboardSynchronizer(
@@ -45,7 +46,15 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
             notificationCenter: notificationCenter,
             observesApplicationLifecycle: false,
             automaticallyMonitors: automaticallyMonitors,
-            clipboardChangeNotification: clipboardChangeNotification)
+            clipboardChangeNotification: clipboardChangeNotification,
+            now: now)
+    }
+
+    /// 这台机器上 `isolated deinit` 在测试结束时会 abort（改动前的同一用例也这样）。
+    /// 把实例留到进程结束，断言才能被记下来。生产代码的 deinit 不动。
+    private static var retained: [VNCClipboardSynchronizer] = []
+    private func retain(_ synchronizer: VNCClipboardSynchronizer) {
+        Self.retained.append(synchronizer)
     }
 
     func testManualGetUsesLatestRemoteClipboardWhileSharingIsOff() {
@@ -149,6 +158,7 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
 
         XCTAssertEqual(clipboard.text, "existing local")
         XCTAssertTrue(sent.isEmpty)
+        retain(synchronizer)
     }
 
     func testSharedClipboardTransfersBothDirectionsWithoutEcho() {
@@ -188,6 +198,7 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         synchronizer.connectionStateDidChange(.connected)
 
         XCTAssertEqual(sent, ["copied while reconnecting"])
+        retain(synchronizer)
     }
 
     func testConnectionBoundaryClearsCachedRemoteClipboard() {
@@ -396,5 +407,114 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         XCTAssertEqual(transfers.count, 2)
         XCTAssertEqual(transfers[0].1, "cached")
         XCTAssertEqual(transfers[1].1, "sent")
+    }
+
+    func testForegroundWhileDisconnectedRetriesOnConnect() {
+        let clipboard = FakeClipboard()
+        var connected = false
+        var sent: [String] = []
+        let synchronizer = makeSynchronizer(
+            clipboard: clipboard,
+            connected: { connected }
+        ) { sent.append($0) }
+        synchronizer.sharedClipboardEnabled = true
+
+        synchronizer.applicationWillResignActive()
+        clipboard.copyOnDevice("copied in background")
+        synchronizer.applicationDidBecomeActive()
+        XCTAssertTrue(sent.isEmpty)
+
+        connected = true
+        synchronizer.connectionStateDidChange(.connected)
+        XCTAssertEqual(sent, ["copied in background"])
+        retain(synchronizer)
+    }
+
+    func testSendDroppedWithinFiveSecondsIsRetried() {
+        let clipboard = FakeClipboard()
+        var connected = true
+        var sent: [String] = []
+        var now = Date(timeIntervalSince1970: 1_000)
+        let synchronizer = makeSynchronizer(
+            clipboard: clipboard,
+            connected: { connected },
+            now: { now }
+        ) { sent.append($0) }
+        synchronizer.sharedClipboardEnabled = true
+        clipboard.copyOnDevice("just sent")
+        synchronizer.localClipboardDidChange()
+        XCTAssertEqual(sent, ["just sent"])
+
+        now = now.addingTimeInterval(1)
+        connected = false
+        synchronizer.connectionStateDidChange(.reconnecting(attempt: 1, delay: 0))
+        connected = true
+        synchronizer.connectionStateDidChange(.connected)
+        XCTAssertEqual(sent, ["just sent", "just sent"])
+        retain(synchronizer)
+    }
+
+    func testSendConfirmedAfterFiveSecondsIsNotRetried() {
+        let clipboard = FakeClipboard()
+        var connected = true
+        var sent: [String] = []
+        var now = Date(timeIntervalSince1970: 1_000)
+        let synchronizer = makeSynchronizer(
+            clipboard: clipboard,
+            connected: { connected },
+            now: { now }
+        ) { sent.append($0) }
+        synchronizer.sharedClipboardEnabled = true
+        clipboard.copyOnDevice("kept")
+        synchronizer.localClipboardDidChange()
+
+        now = now.addingTimeInterval(6)
+        connected = false
+        synchronizer.connectionStateDidChange(.reconnecting(attempt: 1, delay: 0))
+        connected = true
+        synchronizer.connectionStateDidChange(.connected)
+        XCTAssertEqual(sent, ["kept"])
+        retain(synchronizer)
+    }
+
+    func testFreshConnectDoesNotReplayADroppedSend() {
+        let clipboard = FakeClipboard()
+        var connected = true
+        var sent: [String] = []
+        let synchronizer = makeSynchronizer(
+            clipboard: clipboard,
+            connected: { connected }
+        ) { sent.append($0) }
+        synchronizer.sharedClipboardEnabled = true
+        clipboard.copyOnDevice("old server")
+        synchronizer.localClipboardDidChange()
+
+        connected = false
+        synchronizer.connectionStateDidChange(.disconnected)
+        synchronizer.connectionStateDidChange(.connecting)
+        connected = true
+        synchronizer.connectionStateDidChange(.connected)
+        XCTAssertEqual(sent, ["old server"])
+        retain(synchronizer)
+    }
+
+    func testConnectedDoesNotPullOrReplaceClipboards() {
+        let clipboard = FakeClipboard()
+        clipboard.copyOnDevice("phone")
+        var requests = 0
+        var sent: [String] = []
+        let synchronizer = makeSynchronizer(
+            clipboard: clipboard,
+            canRequestRemoteClipboard: { true },
+            requestRemoteClipboard: { requests += 1 },
+            canControlRemoteSharedClipboard: { true }
+        ) { sent.append($0) }
+        synchronizer.sharedClipboardEnabled = true
+        synchronizer.connectionStateDidChange(.connected)
+
+        XCTAssertEqual(requests, 0)
+        XCTAssertEqual(clipboard.text, "phone")
+        XCTAssertTrue(sent.isEmpty)
+        retain(synchronizer)
     }
 }

@@ -1397,6 +1397,7 @@ public final class VNCSession {
         // published login surface here too, so a host that disconnects before
         // the handshake still stops treating the Mac as locked.
         remoteLoginSurface = VNCRemoteLoginSurface()
+        clipboardReplayOnUnlock = nil
         guard connectionState != .idle && connectionState != .disconnected else { return }
 
         intentionallyDisconnected = true
@@ -1587,7 +1588,7 @@ public final class VNCSession {
             case .pointer(let buttonMask, let x, let y):
                 sendPointerEvent(buttonMask: buttonMask, x: x, y: y)
             case .scroll, .gesture, .clipboard, .clipboardRequest,
-                 .pasteText, .sharedClipboard, .curtain:
+                 .pasteText, .pasteDeviceText, .sharedClipboard, .curtain:
                 assertionFailure("Unexpected event in login password sequence")
             }
         }
@@ -1776,6 +1777,7 @@ public final class VNCSession {
         // Android 的 clientClipboard 在 viewOnly 时直接 return。
         guard !isViewOnly else { return }
         guard connectionState.isConnected, transportSession != nil else { return }
+        noteClipboardForUnlockReplay(text)
 
         if isTraceEnabled {
             diagnostics.protocolTrace.recordSent(
@@ -1790,20 +1792,56 @@ public final class VNCSession {
 
     /// 把软键盘定稿文字贴进远端。
     ///
-    /// 能力位 31 可用时写 Apple packed scrap、发 Cmd+V，再把之前的原始 scrap
-    /// 原样回发。不支持时退回逐字发键（与 `insertText` 相同，不含粘滞修饰）。
-    /// 不把文字或剪贴板内容写入日志。
-    public func pasteText(_ text: String) {
+    /// 能力位 31 可用时写 Apple packed scrap、发 Cmd+V。`restoringPreviousClipboard`
+    /// 为 true（默认，输入法上屏）时再把之前的原始 scrap 原样回发；粘贴键传 false，
+    /// 留下刚写进去的内容，之后按 Cmd+V 还能再贴。不支持时退回逐字发键（与
+    /// `insertText` 相同，不含粘滞修饰）。不把文字或剪贴板内容写入日志。
+    public func pasteText(
+        _ text: String,
+        restoringPreviousClipboard: Bool = true
+    ) {
         guard !isViewOnly else { return }
         guard connectionState.isConnected, transportSession != nil else { return }
         guard !text.isEmpty else { return }
         if VNCTextPaste.usesPackedScrap(serverCapabilities) {
-            enqueueInput(.pasteText(text))
+            if restoringPreviousClipboard {
+                enqueueInput(.pasteText(text))
+            } else {
+                enqueueInput(.pasteDeviceText(text))
+            }
         } else {
             for event in VNCTextPaste.keyEvents(for: text) {
                 enqueueInput(.key(downFlag: event.downFlag, keysym: event.keysym))
             }
         }
+    }
+
+    /// 锁屏或登录窗上推出去的文字。解锁后再写一次，因为锁屏时写入能不能留下没有依据。
+    /// 没连上时不记。不写入日志。
+    var clipboardReplayOnUnlock: String?
+    private var isReplayingClipboardAfterUnlock = false
+
+    func noteClipboardForUnlockReplay(_ text: String) {
+        if isReplayingClipboardAfterUnlock { return }
+        if remoteLoginSurface.isLockScreen || remoteLoginSurface.isLoginWindow {
+            clipboardReplayOnUnlock = text
+        } else {
+            clipboardReplayOnUnlock = nil
+        }
+    }
+
+    /// 只有当时明确处在锁屏或登录窗、并且现在两边都不是，才再写一次。
+    /// 没连上就留着，等这条连接回到 `.connected`。两边都没公告过（默认 false）
+    /// 不当成锁屏，否则每次推送都会被攒下来。
+    private func replayClipboardAfterUnlockIfPossible() {
+        guard let pending = clipboardReplayOnUnlock else { return }
+        guard !remoteLoginSurface.isLockScreen,
+              !remoteLoginSurface.isLoginWindow else { return }
+        guard connectionState.isConnected, transportSession != nil else { return }
+        clipboardReplayOnUnlock = nil
+        isReplayingClipboardAfterUnlock = true
+        sendClipboardText(pending)
+        isReplayingClipboardAfterUnlock = false
     }
 
     /// Request the current remote clipboard from a capable Apple server.
@@ -2291,6 +2329,7 @@ public final class VNCSession {
         hasEstablishedConnection = true
         lastError = nil
         connectionState = .connected
+        replayClipboardAfterUnlockIfPossible()
     }
 
     /// A zero-sized ServerInit makes Apple's display layout authoritative for
@@ -2951,9 +2990,16 @@ public final class VNCSession {
         _ state: AppleRemoteSessionState
     ) {
         lastSessionStateAnnouncementNanos = DispatchTime.now().uptimeNanoseconds
+        let wasLocked = remoteLoginSurface.isLockScreen
+            || remoteLoginSurface.isLoginWindow
         remoteLoginSurface = VNCRemoteLoginSurface(
             isLockScreen: state.loginWindowLockScreenActive,
             isLoginWindow: state.loginWindowActive)
+        let nowLocked = remoteLoginSurface.isLockScreen
+            || remoteLoginSurface.isLoginWindow
+        if wasLocked, !nowLocked {
+            replayClipboardAfterUnlockIfPossible()
+        }
         applyCurtainState(state)
         let promptEnabled =
             configuration.promptForLoginPasswordAtLoginWindow
@@ -3026,6 +3072,7 @@ public final class VNCSession {
         if !preservePendingPasswordSend {
             lastLoginPasswordDeliveryNanos = 0
             remoteLoginSurface = VNCRemoteLoginSurface()
+            clipboardReplayOnUnlock = nil
         }
         loginPasswordSendGate.reset(
             preservePendingSend: preservePendingPasswordSend
@@ -3922,7 +3969,8 @@ public final class VNCSession {
     /// 只看时丢掉的是用户输入。帘幕、共享剪贴板开关和拉取远端剪贴板仍可走。
     private static func isBlockedWhileViewOnly(_ event: SessionInputEvent) -> Bool {
         switch event {
-        case .key, .pointer, .scroll, .gesture, .clipboard, .pasteText:
+        case .key, .pointer, .scroll, .gesture, .clipboard, .pasteText,
+             .pasteDeviceText:
             return true
         case .pause, .clipboardRequest, .sharedClipboard, .curtain:
             return false
@@ -4010,6 +4058,20 @@ public final class VNCSession {
                     } catch {
                         self.logger.warning(
                             "Failed to paste committed text: "
+                                + error.localizedDescription)
+                    }
+                case .pasteDeviceText(let text):
+                    do {
+                        let pasted = try await transport.pasteReplacingClipboard(text)
+                        if !pasted {
+                            let events = VNCTextPaste.keyEvents(for: text).map {
+                                ClientInputEvent.key(downFlag: $0.downFlag, key: $0.keysym)
+                            }
+                            try await transport.sendInputEvents(events)
+                        }
+                    } catch {
+                        self.logger.warning(
+                            "Failed to paste device text: "
                                 + error.localizedDescription)
                     }
                 case .sharedClipboard(let enabled):
@@ -4123,7 +4185,7 @@ public final class VNCSession {
         case .pointer(let buttonMask, let x, let y):
             return .pointer(buttonMask: buttonMask, x: x, y: y)
         case .pause, .scroll, .gesture, .clipboard, .clipboardRequest,
-             .pasteText, .sharedClipboard, .curtain:
+             .pasteText, .pasteDeviceText, .sharedClipboard, .curtain:
             return nil
         }
     }
