@@ -734,17 +734,18 @@ final class OrderedMediaPacketCoalescer: @unchecked Sendable {
 /// RemoteDesktopView(session: session)
 /// ```
 
-/// Lock-screen and login-window bits from Apple DisplayInfo2.
-///
-/// `isLockScreen` is flag 0x08 and `isLoginWindow` is flag 0x10. This is the
-/// only session-state surface hosts need for text routing; curtain and console
-/// flags are not included.
+/// `sendLoginPassword(shouldContinue:)` 的结果。
 public enum VNCLoginPasswordDelivery: Sendable {
     case delivered
     case stopped
     case notSent
 }
 
+/// Lock-screen and login-window bits from Apple DisplayInfo2.
+///
+/// `isLockScreen` is flag 0x08 and `isLoginWindow` is flag 0x10. This is the
+/// only session-state surface hosts need for text routing; curtain and console
+/// flags are not included.
 public struct VNCRemoteLoginSurface: Sendable, Equatable {
     public var isLockScreen: Bool
     public var isLoginWindow: Bool
@@ -1602,13 +1603,14 @@ public final class VNCSession {
             framebufferHeight: framebufferHeight)
         let events = Self.loginPasswordFocusInputEvents(x: focus.x, y: focus.y)
             + Self.loginPasswordInputEvents(password: password)
+        let canStop = Self.loginPasswordCanStop(before: events)
         var lastCheckNanos = DispatchTime.now().uptimeNanoseconds
-        for event in events {
+        for (index, event) in events.enumerated() {
             guard connectionState.isConnected, transportSession != nil else {
                 return .stopped
             }
             let now = DispatchTime.now().uptimeNanoseconds
-            if now &- lastCheckNanos >= Self.loginPasswordContinueCheckNanos {
+            if canStop[index], now &- lastCheckNanos >= Self.loginPasswordContinueCheckNanos {
                 lastCheckNanos = now
                 if !shouldContinue() { return .stopped }
             }
@@ -1732,6 +1734,31 @@ public final class VNCSession {
         }
         appendKeyTap(KeyboardInputHandler.keysymReturn)
         return events
+    }
+
+    /// 每个事件之前能不能停。键或鼠标键还按着时不能停，否则 Mac 上会一直按着。
+    /// 暂停都在一次点按之后，取消任务时也不会留下按住的键。
+    nonisolated static func loginPasswordCanStop(
+        before events: [SessionInputEvent]
+    ) -> [Bool] {
+        var heldKeys = Set<UInt32>()
+        var buttonDown = false
+        return events.map { event in
+            let canStop = heldKeys.isEmpty && !buttonDown
+            switch event {
+            case .key(let downFlag, let keysym):
+                if downFlag {
+                    heldKeys.insert(keysym)
+                } else {
+                    heldKeys.remove(keysym)
+                }
+            case .pointer(let buttonMask, _, _):
+                buttonDown = buttonMask != 0
+            default:
+                break
+            }
+            return canStop
+        }
     }
 
     /// 密码行中心是 Vision 的归一化坐标，原点在左下。指针的 y 向下，所以要翻转。

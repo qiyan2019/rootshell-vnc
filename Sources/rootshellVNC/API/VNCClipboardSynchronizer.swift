@@ -320,7 +320,7 @@ public final class VNCClipboardSynchronizer {
         if lastSyncedChangeCount == currentChangeCount { return }
         guard canSend() else { return }
         guard clipboard.hasTransferableContent else { return }
-        guard let text = clipboard.readTransferableText() else { return }
+        guard let text = clipboard.readTransferableText(), !text.isEmpty else { return }
         deliverLocalClipboard(text, previousChangeCount: observedLocalChangeCount)
     }
 

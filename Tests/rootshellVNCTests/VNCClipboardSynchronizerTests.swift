@@ -541,6 +541,17 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         retain(synchronizer)
     }
 
+    func testExplicitPushIgnoresEmptyText() {
+        let clipboard = FakeClipboard()
+        clipboard.copyOnDevice("")
+        var sent: [String] = []
+        let synchronizer = makeSynchronizer(clipboard: clipboard) { sent.append($0) }
+
+        synchronizer.sendClipboardIfChanged()
+        XCTAssertEqual(sent, [])
+        retain(synchronizer)
+    }
+
     func testExplicitPushWhileDisconnectedDoesNotCountAsSent() {
         let clipboard = FakeClipboard()
         clipboard.copyOnDevice("pending")

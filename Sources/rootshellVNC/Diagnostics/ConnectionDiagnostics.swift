@@ -112,7 +112,7 @@ public final class ConnectionDiagnostics: @unchecked Sendable {
     }
     private var _serverInitNameFieldLength: Int?
 
-    /// 名字段前 6 字节的十六进制。后面的桌面名不在这里。
+    /// 名字段开头的十六进制。有能力前缀时 6 字节，没有时 2 字节。不含桌面名。
     public var serverInitPrefixHex: String? {
         get { withLock { _serverInitPrefixHex } }
         set { withLock { _serverInitPrefixHex = newValue } }

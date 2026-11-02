@@ -171,11 +171,11 @@ final class LoginPasswordDeliveryTests: XCTestCase {
         XCTAssertEqual(result, .stopped)
     }
 
-    func testServerInitNameFieldIsLengthAndSixBytePrefix() async throws {
+    func testServerInitNameFieldKeepsLengthAndNoDesktopName() async throws {
         let harness = try await ViewOnlyHarness.connected()
         let diagnostics = harness.session.getDiagnostics()
         XCTAssertEqual(diagnostics.serverInitNameFieldLength, 9)
-        XCTAssertEqual(diagnostics.serverInitPrefixHex, "766965772d6f")
+        XCTAssertEqual(diagnostics.serverInitPrefixHex, "7669")
         harness.session.disconnect()
     }
 

@@ -255,4 +255,36 @@ final class LoginPasswordInputTests: XCTestCase {
         XCTAssertTrue(gate.isPending)
         XCTAssertNil(gate.stableCandidate)
     }
+
+    /// 停下时不能留下按住的键或鼠标键，否则 Mac 上修饰键一直按着。
+    func testDeliveryCanOnlyStopWhenNothingIsHeld() {
+        let events = VNCSession.loginPasswordFocusInputEvents(x: 4, y: 4)
+            + VNCSession.loginPasswordInputEvents(password: "aB")
+        let canStop = VNCSession.loginPasswordCanStop(before: events)
+        XCTAssertEqual(canStop.count, events.count)
+        var heldKeys = Set<UInt32>()
+        var buttonDown = false
+        for (index, event) in events.enumerated() {
+            XCTAssertEqual(canStop[index], heldKeys.isEmpty && !buttonDown, "事件 \(index)")
+            switch event {
+            case .key(let down, let keysym):
+                if down { heldKeys.insert(keysym) } else { heldKeys.remove(keysym) }
+            case .pointer(let mask, _, _):
+                buttonDown = mask != 0
+            case .pause:
+                XCTAssertTrue(canStop[index], "暂停时不能有键按着：事件 \(index)")
+            default:
+                XCTFail("意外的事件")
+            }
+        }
+        XCTAssertTrue(heldKeys.isEmpty)
+        XCTAssertFalse(buttonDown)
+        // Cmd+A 中间（Super 按下之后、抬起之前）不能停。
+        let superDown = events.firstIndex { event in
+            if case .key(true, KeyboardInputHandler.keysymSuperL) = event { return true }
+            return false
+        }
+        XCTAssertNotNil(superDown)
+        if let superDown { XCTAssertFalse(canStop[superDown + 1]) }
+    }
 }

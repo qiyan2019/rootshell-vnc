@@ -740,7 +740,7 @@ public actor TransportSession {
     /// This remains nil for regular RFB servers, which therefore use standard
     /// wheel-button input.
     private var appleServerCapabilities: AppleServerCapabilities?
-    /// ServerInit 名字段长度和前 6 字节。只给诊断用，不含桌面名。
+    /// ServerInit 名字段长度和开头几字节。只给诊断用，不含桌面名。
     private var serverInitNameFieldLength: Int?
     private var serverInitPrefixHex: String?
     private var appleClipboardRequestID: UInt32 = 0
@@ -1875,9 +1875,13 @@ public actor TransportSession {
         log.debug("Sent ClientInit flags=0x\(String(flags, radix: 16))")
     }
 
-    /// 名字段前 6 字节，小写十六进制，中间不空格。更后面是桌面名，不能记。
+    /// 名字段开头，小写十六进制，中间不空格。前两字节为 0 才是能力前缀，留 6 字节（状态 + flags）。
+    /// 否则开头就是桌面名，只留 2 字节，够判断前缀不存在。
     static func serverInitPrefixHex(_ field: Data) -> String {
-        field.prefix(6).reduce(into: "") { hex, byte in
+        let hasPrefix = field.count >= 2
+            && field[field.startIndex] == 0
+            && field[field.startIndex + 1] == 0
+        return field.prefix(hasPrefix ? 6 : 2).reduce(into: "") { hex, byte in
             hex += String(format: "%02x", byte)
         }
     }
