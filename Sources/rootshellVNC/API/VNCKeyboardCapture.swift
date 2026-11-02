@@ -161,6 +161,12 @@ public final class VNCKeyboardCapture {
     @ObservationIgnored
     public var onCommitText: (@MainActor (String) -> Bool)?
 
+    /// 退格、回车、方向键和硬件键下发之前调用。
+    ///
+    /// 宿主用来先把 150ms 窗口里待粘贴的文字发出去。nil 时这些路径与上游一致。
+    @ObservationIgnored
+    public var onPrepareForKey: (@MainActor () -> Void)?
+
     /// Whether the software keyboard should be shown for the remote desktop.
     ///
     /// Two-way synced with `RemoteDesktopView`'s internal keyboard state:
@@ -204,6 +210,18 @@ public final class VNCKeyboardCapture {
     /// hardware-keyboard capture.
     public func routeReservedHostShortcutsToVNC(_ enabled: Bool) {
         routesReservedHostShortcutsToVNC = enabled
+    }
+}
+
+/// 发键前的空钩子。nil 时只执行 `send`。
+@MainActor
+enum UpcomingKeyPreparation {
+    static func perform(
+        _ hook: (@MainActor () -> Void)?,
+        then send: () -> Void
+    ) {
+        hook?()
+        send()
     }
 }
 

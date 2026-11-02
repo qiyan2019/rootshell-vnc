@@ -996,29 +996,39 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     func insertText(_ text: String) {
-        let modifiers = keyboardCapture.supplementalModifiers
-        var dispatched = false
-        // 钩子只拦软键盘定稿文字。退格、回车、方向键、硬件键盘仍走各自的原路径。
-        VNCSoftKeyboardCommit.deliver(
-            text,
-            hook: keyboardCapture.onCommitText
-        ) { character in
-            dispatched = keyboardHandler.handleKeyTap(
-                character,
-                supplementalModifiers: modifiers) || dispatched
+        let send = {
+            let modifiers = self.keyboardCapture.supplementalModifiers
+            var dispatched = false
+            // 钩子只拦软键盘定稿文字。退格、回车、方向键、硬件键盘仍走各自的原路径。
+            VNCSoftKeyboardCommit.deliver(
+                text,
+                hook: self.keyboardCapture.onCommitText
+            ) { character in
+                dispatched = self.keyboardHandler.handleKeyTap(
+                    character,
+                    supplementalModifiers: modifiers) || dispatched
+            }
+            if dispatched, !modifiers.isEmpty {
+                self.keyboardCapture.onSupplementalModifiersConsumed?()
+            }
         }
-        if dispatched, !modifiers.isEmpty {
-            keyboardCapture.onSupplementalModifiersConsumed?()
+        if text.contains(where: { $0 == "\n" || $0 == "\r" }) {
+            UpcomingKeyPreparation.perform(
+                keyboardCapture.onPrepareForKey, then: send)
+        } else {
+            send()
         }
     }
 
     func deleteBackward() {
-        let modifiers = keyboardCapture.supplementalModifiers
-        let dispatched = keyboardHandler.handleKeysymTap(
-            KeyboardInputHandler.keysymBackspace,
-            supplementalModifiers: modifiers)
-        if dispatched, !modifiers.isEmpty {
-            keyboardCapture.onSupplementalModifiersConsumed?()
+        UpcomingKeyPreparation.perform(keyboardCapture.onPrepareForKey) {
+            let modifiers = self.keyboardCapture.supplementalModifiers
+            let dispatched = self.keyboardHandler.handleKeysymTap(
+                KeyboardInputHandler.keysymBackspace,
+                supplementalModifiers: modifiers)
+            if dispatched, !modifiers.isEmpty {
+                self.keyboardCapture.onSupplementalModifiersConsumed?()
+            }
         }
     }
 
@@ -1027,6 +1037,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             super.pressesBegan(presses, with: event)
             return
         }
+        keyboardCapture.onPrepareForKey?()
         var unhandled: Set<UIPress> = []
         for press in presses {
             guard let key = press.key else {
@@ -1124,6 +1135,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         if routeUniversalCommandIfNeeded(command) { return }
         guard keyboardCapture.isCaptured,
               let remoteCommand = Self.remoteCommand(matching: command) else { return }
+        keyboardCapture.onPrepareForKey?()
         releaseAllPressedKeys()
         keyboardHandler.handleRemoteCommand(remoteCommand)
     }
@@ -1141,6 +1153,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         default: return
         }
 
+        keyboardCapture.onPrepareForKey?()
         beginSupplementalModifiersIfNeeded(for: usage)
         let keysym = KeyboardInputHandler.keysymForHIDUsage(
             usage,
@@ -1153,6 +1166,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         guard keyboardCapture.isCaptured,
               let character = command.input?.lowercased().first,
               character == "h" || character == "m" else { return }
+        keyboardCapture.onPrepareForKey?()
         releaseAllPressedKeys()
         keyboardHandler.handleCommandTap(character)
     }
@@ -1452,6 +1466,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
               keyboardCapture.isCaptured, keyboardCapture.controlOptionAsCommand else { return }
         if (0xE0...0xE7).contains(usage) {
             if pressed {
+                keyboardCapture.onPrepareForKey?()
                 _ = hardwareKeyboard.press(usage: usage,
                     keysym: KeyboardInputHandler.keysymForHIDUsage(usage, characters: "",
                         appleModifierConvention: keyboardHandler.usesAppleModifierMapping))
@@ -1473,6 +1488,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         // particular, Catalyst can swallow mapped arrows before UIKit.
         if (0x28...0x73).contains(usage),
            KeyboardInputHandler.keysymForHIDUsage(usage, characters: "") != 0 {
+            keyboardCapture.onPrepareForKey?()
             pressUniversalKey(usage: usage, characters: "", flags: flags)
         }
     }
@@ -1490,6 +1506,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         }
         guard isFirstResponder, keyboardCapture.isCaptured,
               !keyboardCapture.controlOptionAsCommand, isExactAlias else { return }
+        keyboardCapture.onPrepareForKey?()
         releaseAllPressedKeys()
         if consumedRemoteAliasUsages.insert(usage).inserted {
             keyboardHandler.handleCommandTap(character)
@@ -1524,6 +1541,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         let keysym = KeyboardInputHandler.keysymForHIDUsage(usage, characters: "")
         guard keysym != 0 else { return }
 
+        keyboardCapture.onPrepareForKey?()
         // A physical modifier that reached RFB via pressesBegan is cleared so
         // each atomic chord is self-contained; subsequent repeats then no-op.
         releaseAllPressedKeys()
@@ -1545,6 +1563,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
                     self?.stopCatalystArrowRepeat(matching: usage)
                     return
                 }
+                self.keyboardCapture.onPrepareForKey?()
                 self.keyboardHandler.handleKeysymTap(keysym, supplementalModifiers: modifiers)
                 let repeating = Timer(timeInterval: 0.03, repeats: true) { [weak self] _ in
                     MainActor.assumeIsolated {
@@ -1553,6 +1572,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
                             self?.stopCatalystArrowRepeat(matching: usage)
                             return
                         }
+                        self.keyboardCapture.onPrepareForKey?()
                         self.keyboardHandler.handleKeysymTap(
                             keysym, supplementalModifiers: modifiers)
                     }
@@ -1612,6 +1632,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
 
         // Any physical modifier that reached RFB before UIKit delivered this
         // command is cleared so the atomic chord is the only thing in flight.
+        // 先腾出待贴文字，再抬起已经按住的修饰，避免键抬起抢在粘贴前面。
+        self.keyboardCapture.onPrepareForKey?()
         releaseAllPressedKeys()
         keyboardHandler.handleKeysymTap(
             KeyboardInputHandler.keysymBackspace,
@@ -1620,6 +1642,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
 
     @objc private func handleControlKeyCommand(_ command: UIKeyCommand) {
         guard keyboardCapture.isCaptured else { return }
+        keyboardCapture.onPrepareForKey?()
         ensureModifierKeys(for: command.modifierFlags)
 
         let usage: UInt32?

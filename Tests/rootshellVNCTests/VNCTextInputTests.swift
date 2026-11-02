@@ -64,6 +64,18 @@ final class VNCTextInputTests: XCTestCase {
             0x01004E2D)
     }
 
+    func testPrepareForKeyRunsBeforeTheKeyAndIsSkippedWhenNil() {
+        var order: [String] = []
+        UpcomingKeyPreparation.perform({ order.append("prepare") }) {
+            order.append("key")
+        }
+        XCTAssertEqual(order, ["prepare", "key"])
+
+        order.removeAll()
+        UpcomingKeyPreparation.perform(nil) { order.append("key") }
+        XCTAssertEqual(order, ["key"])
+    }
+
     func testPasteTextIsAnOrderingBarrier() {
         var queue = SessionInputQueue()
         queue.enqueue(.pasteText("hi"))
@@ -145,6 +157,38 @@ final class VNCTextInputViewTests: XCTestCase {
             KeyboardInputHandler.keysymSuperL,
         ])
         XCTAssertTrue(consumed)
+    }
+
+    func testDeleteBackwardPreparesBeforeBackspace() {
+        let log = EventLog()
+        let capture = VNCKeyboardCapture()
+        var order: [String] = []
+        capture.onPrepareForKey = { order.append("prepare") }
+        let view = makeView(capture: capture, log: log)
+        view.deleteBackward()
+        XCTAssertEqual(order, ["prepare"])
+        XCTAssertEqual(log.events.map(\.keysym), [
+            KeyboardInputHandler.keysymBackspace,
+            KeyboardInputHandler.keysymBackspace,
+        ])
+        XCTAssertEqual(log.events.map(\.downFlag), [true, false])
+    }
+
+    func testNewlinePreparesBeforeCharactersButPlainTextDoesNot() {
+        let log = EventLog()
+        let capture = VNCKeyboardCapture()
+        var prepared = 0
+        capture.onPrepareForKey = { prepared += 1 }
+        let view = makeView(capture: capture, log: log)
+
+        view.insertText("a")
+        XCTAssertEqual(prepared, 0)
+        XCTAssertFalse(log.events.isEmpty)
+
+        log.events.removeAll()
+        view.insertText("\n")
+        XCTAssertEqual(prepared, 1)
+        XCTAssertEqual(log.events.map(\.keysym).first, KeyboardInputHandler.keysymReturn)
     }
 }
 #endif
