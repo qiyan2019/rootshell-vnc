@@ -733,6 +733,22 @@ final class OrderedMediaPacketCoalescer: @unchecked Sendable {
 /// // In SwiftUI:
 /// RemoteDesktopView(session: session)
 /// ```
+
+/// Lock-screen and login-window bits from Apple DisplayInfo2.
+///
+/// `isLockScreen` is flag 0x08 and `isLoginWindow` is flag 0x10. This is the
+/// only session-state surface hosts need for text routing; curtain and console
+/// flags are not included.
+public struct VNCRemoteLoginSurface: Sendable, Equatable {
+    public var isLockScreen: Bool
+    public var isLoginWindow: Bool
+
+    public init(isLockScreen: Bool = false, isLoginWindow: Bool = false) {
+        self.isLockScreen = isLockScreen
+        self.isLoginWindow = isLoginWindow
+    }
+}
+
 @MainActor
 @Observable
 public final class VNCSession {
@@ -882,7 +898,15 @@ public final class VNCSession {
     /// Whether the server has requested a one-shot password confirmation for
     /// the current Apple Login Window episode. This remains pending until a
     /// host UI consumes it, so an event received during navigation is not lost.
+    /// Consuming it does not clear ``remoteLoginSurface``.
     public private(set) var loginPasswordPromptPending = false
+
+    /// The lock-screen and login-window bits from the latest DisplayInfo2
+    /// announcement. Other session fields (curtain, console) stay internal.
+    /// Both are false until the server announces them. A new connection or an
+    /// explicit disconnect clears them; automatic transport recovery keeps the
+    /// last announcement so a gap cannot be treated as an unlocked desktop.
+    public private(set) var remoteLoginSurface = VNCRemoteLoginSurface()
 
     // MARK: - Configuration
 
@@ -1369,6 +1393,10 @@ public final class VNCSession {
     /// Cancels all active tasks, closes the transport, and resets the session
     /// state. Safe to call even when not connected.
     public func disconnect() {
+        // Idle sessions never reach `resetAppleLoginPromptState`. Drop the
+        // published login surface here too, so a host that disconnects before
+        // the handshake still stops treating the Mac as locked.
+        remoteLoginSurface = VNCRemoteLoginSurface()
         guard connectionState != .idle && connectionState != .disconnected else { return }
 
         intentionallyDisconnected = true
@@ -2919,10 +2947,13 @@ public final class VNCSession {
         }
     }
 
-    private func handleAppleRemoteSessionState(
+    func handleAppleRemoteSessionState(
         _ state: AppleRemoteSessionState
     ) {
         lastSessionStateAnnouncementNanos = DispatchTime.now().uptimeNanoseconds
+        remoteLoginSurface = VNCRemoteLoginSurface(
+            isLockScreen: state.loginWindowLockScreenActive,
+            isLoginWindow: state.loginWindowActive)
         applyCurtainState(state)
         let promptEnabled =
             configuration.promptForLoginPasswordAtLoginWindow
@@ -2994,6 +3025,7 @@ public final class VNCSession {
         // because it is still the same remote login attempt.
         if !preservePendingPasswordSend {
             lastLoginPasswordDeliveryNanos = 0
+            remoteLoginSurface = VNCRemoteLoginSurface()
         }
         loginPasswordSendGate.reset(
             preservePendingSend: preservePendingPasswordSend
