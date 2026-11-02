@@ -72,6 +72,8 @@ public struct RemoteDesktopView: View {
     private let onSharedClipboardUserChange: (@MainActor (Bool) -> Void)?
     private let hostOwnsRecoveryChrome: Bool
     private let brightnessGain: Double
+    /// 为 false 时不画内置 HUD。默认 true，和上游一样画 `viewportControls`。
+    private let showsBuiltInControls: Bool
     private let pointerSpeed: Double
     /// On-screen height of the locally drawn pointer, in view points. The
     /// host owns this because only it knows the display the desktop is being
@@ -100,7 +102,8 @@ public struct RemoteDesktopView: View {
         cursorHeight: CGFloat = 17,
         onSharedClipboardUserChange: (@MainActor (Bool) -> Void)? = nil,
         hostOwnsRecoveryChrome: Bool = false,
-        brightnessGain: Double = 1.0
+        brightnessGain: Double = 1.0,
+        showsBuiltInControls: Bool = true
     ) {
         self.init(
             session: session,
@@ -116,6 +119,7 @@ public struct RemoteDesktopView: View {
             onSharedClipboardUserChange: onSharedClipboardUserChange,
             hostOwnsRecoveryChrome: hostOwnsRecoveryChrome,
             brightnessGain: brightnessGain,
+            showsBuiltInControls: showsBuiltInControls,
             hudMenuExtras: nil)
     }
 
@@ -139,6 +143,7 @@ public struct RemoteDesktopView: View {
         onSharedClipboardUserChange: (@MainActor (Bool) -> Void)? = nil,
         hostOwnsRecoveryChrome: Bool = false,
         brightnessGain: Double = 1.0,
+        showsBuiltInControls: Bool = true,
         @ViewBuilder hudMenuExtras: () -> MenuExtras
     ) {
         self.init(
@@ -155,6 +160,7 @@ public struct RemoteDesktopView: View {
             onSharedClipboardUserChange: onSharedClipboardUserChange,
             hostOwnsRecoveryChrome: hostOwnsRecoveryChrome,
             brightnessGain: brightnessGain,
+            showsBuiltInControls: showsBuiltInControls,
             hudMenuExtras: AnyView(hudMenuExtras()))
     }
 
@@ -172,11 +178,13 @@ public struct RemoteDesktopView: View {
         onSharedClipboardUserChange: (@MainActor (Bool) -> Void)?,
         hostOwnsRecoveryChrome: Bool,
         brightnessGain: Double,
+        showsBuiltInControls: Bool,
         hudMenuExtras: AnyView?
     ) {
         self.session = session
         self.hostOwnsRecoveryChrome = hostOwnsRecoveryChrome
         self.hudMenuExtras = hudMenuExtras
+        self.showsBuiltInControls = showsBuiltInControls
         self._viewportPanningMode = State(initialValue: initialViewportPanningMode)
         self._pointerMode = State(initialValue: initialPointerMode)
         self.pointerSpeed = pointerSpeed
@@ -247,7 +255,9 @@ public struct RemoteDesktopView: View {
                             framebufferOrigin: framebufferOrigin)
                     }
 
-                    viewportControls
+                    if showsBuiltInControls {
+                        viewportControls
+                    }
 
                     VNCCurtainPrompt(
                         session: session,
