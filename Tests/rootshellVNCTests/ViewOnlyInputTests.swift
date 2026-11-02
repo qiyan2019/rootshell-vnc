@@ -114,6 +114,114 @@ final class ViewOnlySessionTests: XCTestCase {
 }
 
 @MainActor
+final class LoginPasswordDeliveryTests: XCTestCase {
+    func testUnconnectedOrViewOnlySendIsNotSent() async throws {
+        let idle = await VNCSession().sendLoginPassword { true }
+        XCTAssertEqual(idle, .notSent)
+
+        let harness = try await ViewOnlyHarness.connected()
+        let session = harness.session
+        session.isViewOnly = true
+        let blocked = await session.sendLoginPassword { true }
+        XCTAssertEqual(blocked, .notSent)
+        session.disconnect()
+    }
+
+    func testContinueFalseStopsBeforeTheKeysAfterTheFocusPause() async throws {
+        let harness = try await ViewOnlyHarness.connected()
+        let before = await harness.connection.sentBytes().count
+        var checks = 0
+        let result = await harness.session.sendLoginPassword {
+            checks += 1
+            return false
+        }
+        XCTAssertEqual(result, .stopped)
+        XCTAssertGreaterThan(checks, 0)
+        let added = Data((await harness.connection.sentBytes()).dropFirst(before))
+        let click = ClientMessage.pointerEvent(buttonMask: 0, x: 4, y: 4).serialize()
+        let selectAll = ClientMessage.keyEvent(downFlag: true, key: 0x61).serialize()
+        XCTAssertNotNil(added.range(of: click))
+        XCTAssertNil(added.range(of: selectAll))
+        harness.session.disconnect()
+    }
+
+    func testDeliverySendsTheReturnKeyWhenContinuing() async throws {
+        let harness = try await ViewOnlyHarness.connected()
+        let before = await harness.connection.sentBytes().count
+        let result = await harness.session.sendLoginPassword { true }
+        XCTAssertEqual(result, .delivered)
+        let added = Data((await harness.connection.sentBytes()).dropFirst(before))
+        let returnDown = ClientMessage.keyEvent(
+            downFlag: true,
+            key: KeyboardInputHandler.keysymReturn).serialize()
+        XCTAssertNotNil(added.range(of: returnDown))
+        harness.session.disconnect()
+    }
+
+    func testDisconnectDuringDeliveryStops() async throws {
+        let harness = try await ViewOnlyHarness.connected()
+        var stoppedTheSession = false
+        let result = await harness.session.sendLoginPassword {
+            if !stoppedTheSession {
+                stoppedTheSession = true
+                harness.session.disconnect()
+            }
+            return true
+        }
+        XCTAssertEqual(result, .stopped)
+    }
+
+    func testServerInitNameFieldKeepsLengthAndNoDesktopName() async throws {
+        let harness = try await ViewOnlyHarness.connected()
+        let diagnostics = harness.session.getDiagnostics()
+        XCTAssertEqual(diagnostics.serverInitNameFieldLength, 9)
+        XCTAssertEqual(diagnostics.serverInitPrefixHex, "7669")
+        harness.session.disconnect()
+    }
+
+    func testUnknownClipboardReplaysOnceOnTheFirstUnlockedAnnouncement() async throws {
+        let harness = try await ViewOnlyHarness.connected()
+        harness.session.noteClipboardForUnlockReplay("early")
+        XCTAssertEqual(harness.session.clipboardReplayOnUnlock, "early")
+        let before = (await harness.connection.sentBytes()).count
+        harness.session.handleAppleRemoteSessionState(AppleRemoteSessionState(
+            loginWindowActive: false,
+            loginWindowLockScreenActive: false))
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertNil(harness.session.clipboardReplayOnUnlock)
+        let once = await harness.connection.sentBytes()
+        XCTAssertGreaterThan(once.count, before)
+        harness.session.handleAppleRemoteSessionState(AppleRemoteSessionState(
+            loginWindowActive: false,
+            loginWindowLockScreenActive: false))
+        try await Task.sleep(for: .milliseconds(200))
+        let twice = await harness.connection.sentBytes()
+        XCTAssertEqual(twice, once)
+        harness.session.disconnect()
+    }
+
+    func testRecheckOffersThePromptWhenLoginStaysActive() async throws {
+        let harness = try await ViewOnlyHarness.connected()
+        harness.session.configuration.promptForLoginPasswordAtLoginWindow = true
+        harness.session.handleAppleRemoteSessionState(AppleRemoteSessionState(
+            loginWindowActive: true,
+            loginWindowLockScreenActive: false))
+        XCTAssertTrue(harness.session.consumeLoginPasswordPromptRequest())
+        harness.session.sendLoginPassword()
+        harness.session.handleAppleRemoteSessionState(AppleRemoteSessionState(
+            loginWindowActive: false,
+            loginWindowLockScreenActive: false))
+        harness.session.handleAppleRemoteSessionState(AppleRemoteSessionState(
+            loginWindowActive: true,
+            loginWindowLockScreenActive: false))
+        XCTAssertFalse(harness.session.loginPasswordPromptPending)
+        try await Task.sleep(for: .seconds(12))
+        XCTAssertTrue(harness.session.loginPasswordPromptPending)
+        harness.session.disconnect()
+    }
+}
+
+@MainActor
 private struct ViewOnlyHarness {
     let session: VNCSession
     let connection: ViewOnlyScriptedConnection

@@ -6,10 +6,17 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
     private final class FakeClipboard: VNCClipboardProviding {
         var changeCount = 0
         var text: String?
+        var readCount = 0
+        var reportsTransferableContent = true
 
-        var hasTransferableContent: Bool { text != nil }
+        var hasTransferableContent: Bool {
+            reportsTransferableContent && text != nil
+        }
 
-        func readTransferableText() -> String? { text }
+        func readTransferableText() -> String? {
+            readCount += 1
+            return text
+        }
 
         func writeText(_ text: String) {
             self.text = text
@@ -515,6 +522,120 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         XCTAssertEqual(requests, 0)
         XCTAssertEqual(clipboard.text, "phone")
         XCTAssertTrue(sent.isEmpty)
+        retain(synchronizer)
+    }
+
+    func testExplicitPushSkipsUnchangedChangeCountAndDoesNotRead() {
+        let clipboard = FakeClipboard()
+        clipboard.copyOnDevice("same")
+        var sent: [String] = []
+        let synchronizer = makeSynchronizer(clipboard: clipboard) { sent.append($0) }
+
+        synchronizer.sendClipboardIfChanged()
+        XCTAssertEqual(sent, ["same"])
+        let readsAfterPush = clipboard.readCount
+
+        synchronizer.sendClipboardIfChanged()
+        XCTAssertEqual(sent, ["same"])
+        XCTAssertEqual(clipboard.readCount, readsAfterPush)
+        retain(synchronizer)
+    }
+
+    func testExplicitPushIgnoresEmptyText() {
+        let clipboard = FakeClipboard()
+        clipboard.copyOnDevice("")
+        var sent: [String] = []
+        let synchronizer = makeSynchronizer(clipboard: clipboard) { sent.append($0) }
+
+        synchronizer.sendClipboardIfChanged()
+        XCTAssertEqual(sent, [])
+        retain(synchronizer)
+    }
+
+    func testExplicitPushWhileDisconnectedDoesNotCountAsSent() {
+        let clipboard = FakeClipboard()
+        clipboard.copyOnDevice("pending")
+        var connected = false
+        var sent: [String] = []
+        let synchronizer = makeSynchronizer(
+            clipboard: clipboard,
+            connected: { connected }
+        ) { sent.append($0) }
+
+        synchronizer.sendClipboardIfChanged()
+        XCTAssertTrue(sent.isEmpty)
+        XCTAssertEqual(clipboard.readCount, 0)
+
+        connected = true
+        synchronizer.sendClipboardIfChanged()
+        XCTAssertEqual(sent, ["pending"])
+        retain(synchronizer)
+    }
+
+    func testExplicitPushDoesNotReadWhenNothingIsTransferable() {
+        let clipboard = FakeClipboard()
+        clipboard.copyOnDevice("not text")
+        clipboard.reportsTransferableContent = false
+        var sent: [String] = []
+        let synchronizer = makeSynchronizer(clipboard: clipboard) { sent.append($0) }
+
+        synchronizer.sendClipboardIfChanged()
+        XCTAssertTrue(sent.isEmpty)
+        XCTAssertEqual(clipboard.readCount, 0)
+        retain(synchronizer)
+    }
+
+    func testExplicitPushIgnoresTheSyncBaseline() {
+        let clipboard = FakeClipboard()
+        clipboard.copyOnDevice("already there")
+        var sent: [String] = []
+        let synchronizer = makeSynchronizer(clipboard: clipboard) { sent.append($0) }
+        synchronizer.sharedClipboardEnabled = true
+        XCTAssertTrue(sent.isEmpty)
+
+        synchronizer.sendClipboardIfChanged()
+        XCTAssertEqual(sent, ["already there"])
+        retain(synchronizer)
+    }
+
+    func testDroppedExplicitPushIsSentAgainAfterReconnect() {
+        let clipboard = FakeClipboard()
+        clipboard.copyOnDevice("retry")
+        var connected = true
+        var sent: [String] = []
+        var now = Date(timeIntervalSince1970: 2_000)
+        let synchronizer = makeSynchronizer(
+            clipboard: clipboard,
+            connected: { connected },
+            now: { now }
+        ) { sent.append($0) }
+
+        synchronizer.sendClipboardIfChanged()
+        XCTAssertEqual(sent, ["retry"])
+
+        now = now.addingTimeInterval(1)
+        connected = false
+        synchronizer.connectionStateDidChange(.disconnected)
+        synchronizer.sendClipboardIfChanged()
+        XCTAssertEqual(sent, ["retry"])
+
+        connected = true
+        synchronizer.sendClipboardIfChanged()
+        XCTAssertEqual(sent, ["retry", "retry"])
+        retain(synchronizer)
+    }
+
+    func testRemoteApplyUpdatesTheSyncedChangeCount() {
+        let clipboard = FakeClipboard()
+        clipboard.copyOnDevice("local")
+        var sent: [String] = []
+        let synchronizer = makeSynchronizer(clipboard: clipboard) { sent.append($0) }
+        synchronizer.sharedClipboardEnabled = true
+        synchronizer.receiveRemoteClipboardText("from mac")
+        let reads = clipboard.readCount
+        synchronizer.sendClipboardIfChanged()
+        XCTAssertTrue(sent.isEmpty)
+        XCTAssertEqual(clipboard.readCount, reads)
         retain(synchronizer)
     }
 }

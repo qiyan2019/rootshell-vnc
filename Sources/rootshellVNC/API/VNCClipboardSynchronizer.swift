@@ -189,8 +189,14 @@ public final class VNCClipboardSynchronizer {
     /// 刚推出去、还没被连接活过 5 秒确认的那次本地变更。断线落在这个窗口里就收回，连上再发。
     @ObservationIgnored
     private var unconfirmedPreviousChangeCount: Int?
+    /// 这次推送之前的 `lastSyncedChangeCount`。收回推送时一起退回去。
+    @ObservationIgnored
+    private var unconfirmedLastSyncedChangeCount: Int?
     @ObservationIgnored
     private var unconfirmedAt: Date?
+    /// 已经和远端对齐过的本机 changeCount。nil 表示还没成功推过，也不把远端写回记过。
+    @ObservationIgnored
+    private var lastSyncedChangeCount: Int?
     private let unconfirmedSendInterval: TimeInterval = 5
     @ObservationIgnored
     private var invalidated = false
@@ -301,6 +307,20 @@ public final class VNCClipboardSynchronizer {
     public func sendClipboard() {
         guard !invalidated, canSend(),
               let text = clipboard.readTransferableText() else { return }
+        deliverLocalClipboard(text, previousChangeCount: observedLocalChangeCount)
+    }
+
+    /// 键栏 Cmd+V。上次记下的 changeCount 没变就返回，不读剪贴板。
+    ///
+    /// 不受同步基线限制：刚打开同步、内容还是那一份，第一次也要推。
+    /// 没连上不算发过。没有可传内容时不调用读取接口。
+    public func sendClipboardIfChanged() {
+        guard !invalidated else { return }
+        let currentChangeCount = clipboard.changeCount
+        if lastSyncedChangeCount == currentChangeCount { return }
+        guard canSend() else { return }
+        guard clipboard.hasTransferableContent else { return }
+        guard let text = clipboard.readTransferableText(), !text.isEmpty else { return }
         deliverLocalClipboard(text, previousChangeCount: observedLocalChangeCount)
     }
 
@@ -452,6 +472,7 @@ public final class VNCClipboardSynchronizer {
         isApplyingRemoteText = true
         clipboard.writeText(text)
         observedLocalChangeCount = clipboard.changeCount
+        lastSyncedChangeCount = clipboard.changeCount
         isApplyingRemoteText = false
         clearUnconfirmedLocalPush()
         onTransfer?(.remoteToDevice, text)
@@ -469,6 +490,8 @@ public final class VNCClipboardSynchronizer {
     private func deliverLocalClipboard(_ text: String, previousChangeCount: Int) {
         observedLocalChangeCount = clipboard.changeCount
         unconfirmedPreviousChangeCount = previousChangeCount
+        unconfirmedLastSyncedChangeCount = lastSyncedChangeCount
+        lastSyncedChangeCount = clipboard.changeCount
         unconfirmedAt = now()
         send(text)
         onTransfer?(.deviceToRemote, text)
@@ -476,6 +499,7 @@ public final class VNCClipboardSynchronizer {
 
     private func clearUnconfirmedLocalPush() {
         unconfirmedPreviousChangeCount = nil
+        unconfirmedLastSyncedChangeCount = nil
         unconfirmedAt = nil
     }
 
@@ -483,9 +507,11 @@ public final class VNCClipboardSynchronizer {
         guard let at = unconfirmedAt,
               let previous = unconfirmedPreviousChangeCount else { return }
         let recent = now().timeIntervalSince(at) <= unconfirmedSendInterval
+        let syncedBeforePush = unconfirmedLastSyncedChangeCount
         clearUnconfirmedLocalPush()
         if recent {
             observedLocalChangeCount = previous
+            lastSyncedChangeCount = syncedBeforePush
         }
     }
 

@@ -15,6 +15,21 @@ struct AppleLoginTextAnalysis: Equatable, Sendable {
     let isLoginScreen: Bool
     let recognizedLineCount: Int
     let evidence: String
+    /// 第一条含密码词的行的中心。归一化，原点在左下。强短语命中时就是那一行。
+    var passwordLineCenter: CGPoint? = nil
+}
+
+/// 对一张完整帧做一次 OCR。识别失败按「不是登录界面」。
+public enum VNCLoginScreenRecognizer {
+    public static func isLoginScreen(_ image: CGImage) async -> Bool {
+        await Task.detached(priority: .utility) {
+            do {
+                return try AppleLoginScreenDetector.recognize(cgImage: image).isLoginScreen
+            } catch {
+                return false
+            }
+        }.value
+    }
 }
 
 /// Conservative visual fallback for the ordinary macOS user lock screen.
@@ -49,27 +64,32 @@ enum AppleLoginScreenDetector {
             (text: normalize(line.text), bounds: line.bounds)
         }
 
-        if normalized.contains(where: { containsStrongLoginPhrase($0.text) }) {
+        if let phrase = normalized.first(where: { containsStrongLoginPhrase($0.text) }) {
             return AppleLoginTextAnalysis(
                 isLoginScreen: true,
                 recognizedLineCount: lines.count,
-                evidence: "central password-entry phrase")
+                evidence: "central password-entry phrase",
+                passwordLineCenter: CGPoint(x: phrase.bounds.midX, y: phrase.bounds.midY))
         }
 
         let combined = normalized.map { $0.text }.joined(separator: " ")
-        let hasPassword = containsPasswordWord(combined)
+        let passwordLine = normalized.first { containsPasswordWord($0.text) }
+        let hasPassword = passwordLine != nil
         let hasBiometric = combined.contains("touch id")
             || combined.contains("touchid")
         let actionCount = loginActions.reduce(into: 0) { count, action in
             if combined.contains(action) { count += 1 }
         }
-        if hasPassword && (hasBiometric || actionCount >= 2) {
+        if hasPassword, let passwordLine, hasBiometric || actionCount >= 2 {
             return AppleLoginTextAnalysis(
                 isLoginScreen: true,
                 recognizedLineCount: lines.count,
                 evidence: hasBiometric
                     ? "password and Touch ID"
-                    : "password and login-window actions")
+                    : "password and login-window actions",
+                passwordLineCenter: CGPoint(
+                    x: passwordLine.bounds.midX,
+                    y: passwordLine.bounds.midY))
         }
 
         return AppleLoginTextAnalysis(
