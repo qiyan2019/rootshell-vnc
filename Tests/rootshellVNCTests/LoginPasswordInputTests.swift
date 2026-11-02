@@ -29,6 +29,21 @@ final class LoginPasswordInputTests: XCTestCase {
         ])
     }
 
+    func testPasswordLineCenterFlipsVisionYAndFallsBackToFrameCenter() {
+        let center = VNCSession.loginPasswordClickPoint(
+            passwordLineCenter: nil,
+            framebufferWidth: 200,
+            framebufferHeight: 100)
+        XCTAssertEqual(center.x, 100)
+        XCTAssertEqual(center.y, 50)
+        let line = VNCSession.loginPasswordClickPoint(
+            passwordLineCenter: CGPoint(x: 0.25, y: 0.2),
+            framebufferWidth: 200,
+            framebufferHeight: 100)
+        XCTAssertEqual(line.x, 50)
+        XCTAssertEqual(line.y, 80)
+    }
+
     func testPasswordFocusClickClearsFieldBeforeTypingBarrier() {
         XCTAssertEqual(
             VNCSession.loginPasswordFocusInputEvents(x: 800, y: 600),

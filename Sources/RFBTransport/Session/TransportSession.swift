@@ -740,6 +740,9 @@ public actor TransportSession {
     /// This remains nil for regular RFB servers, which therefore use standard
     /// wheel-button input.
     private var appleServerCapabilities: AppleServerCapabilities?
+    /// ServerInit 名字段长度和前 6 字节。只给诊断用，不含桌面名。
+    private var serverInitNameFieldLength: Int?
+    private var serverInitPrefixHex: String?
     private var appleClipboardRequestID: UInt32 = 0
     /// 最近一条服务端 type-31 的原始字节，供定稿文字粘贴后原样回发。
     private var textPaste = AppleTextPasteState()
@@ -1287,7 +1290,9 @@ public actor TransportSession {
             offeredSecurityTypes: stateMachine.offeredSecurityTypes,
             selectedSecurityType: stateMachine.selectedSecurityType,
             contentEncryption: contentEncryption,
-            appleServerCapabilities: appleServerCapabilities)
+            appleServerCapabilities: appleServerCapabilities,
+            serverInitNameFieldLength: serverInitNameFieldLength,
+            serverInitPrefixHex: serverInitPrefixHex)
     }
 
     /// Live traffic statistics. The recent-rate window spans the time since
@@ -1870,6 +1875,13 @@ public actor TransportSession {
         log.debug("Sent ClientInit flags=0x\(String(flags, radix: 16))")
     }
 
+    /// 名字段前 6 字节，小写十六进制，中间不空格。更后面是桌面名，不能记。
+    static func serverInitPrefixHex(_ field: Data) -> String {
+        field.prefix(6).reduce(into: "") { hex, byte in
+            hex += String(format: "%02x", byte)
+        }
+    }
+
     private func readServerInit() async throws {
         // Read the fixed-size portion: width(2) + height(2) + pixelFormat(16) + nameLength(4) = 24
         log.info("Reading ServerInit (\(ServerInit.minWireSize) bytes)...")
@@ -1886,6 +1898,8 @@ public actor TransportSession {
                 Int(nameLen), limit: Self.maxTextFieldBytes, context: "ServerInit name")
         }
         let serverInitNameField = try await readControlChannel(exactly: Int(nameLen))
+        serverInitNameFieldLength = serverInitNameField.count
+        serverInitPrefixHex = Self.serverInitPrefixHex(serverInitNameField)
         var nameData = serverInitNameField
         if stateMachine.negotiatedVersion?.isApple == true,
            let capabilities = AppleServerCapabilities(

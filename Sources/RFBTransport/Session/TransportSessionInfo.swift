@@ -38,6 +38,10 @@ public struct TransportHandshakeInfo: Sendable, Equatable {
     /// Structured command support advertised by an Apple RFB 3.889 server;
     /// nil for regular RFB servers.
     public let appleServerCapabilities: AppleServerCapabilities?
+    /// ServerInit 名字段的字节数。还没读到 ServerInit 时是 nil。
+    public let serverInitNameFieldLength: Int?
+    /// 名字段前 6 字节的十六进制，不含后面的桌面名。不足 6 字节就只记已有的。
+    public let serverInitPrefixHex: String?
 }
 
 // MARK: - Live statistics

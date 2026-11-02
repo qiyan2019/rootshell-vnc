@@ -71,4 +71,20 @@ final class VNCRemoteLoginSurfaceTests: XCTestCase {
         session.disconnect()
         XCTAssertNil(session.clipboardReplayOnUnlock)
     }
+
+    func testClipboardNotedBeforeAnyAnnouncementIsKeptUntilAnUnlockedAnnouncement() {
+        let session = VNCSession()
+        session.noteClipboardForUnlockReplay("early")
+        XCTAssertEqual(session.clipboardReplayOnUnlock, "early")
+
+        session.handleAppleRemoteSessionState(AppleRemoteSessionState(
+            loginWindowActive: true,
+            loginWindowLockScreenActive: false))
+        XCTAssertEqual(session.clipboardReplayOnUnlock, "early")
+
+        session.handleAppleRemoteSessionState(AppleRemoteSessionState(
+            loginWindowActive: false,
+            loginWindowLockScreenActive: false))
+        XCTAssertEqual(session.clipboardReplayOnUnlock, "early")
+    }
 }

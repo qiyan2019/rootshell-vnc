@@ -12,6 +12,9 @@ import RFBTransport
 /// let diagnostics = session.getDiagnostics()
 /// print(diagnostics.summary())
 /// ```
+/// `getDiagnostics()` 返回的就是这个类型。设计文档里的名字留在这里，调用方两种都能用。
+public typealias VNCSessionDiagnostics = ConnectionDiagnostics
+
 public final class ConnectionDiagnostics: @unchecked Sendable {
 
     // MARK: - Properties
@@ -102,6 +105,20 @@ public final class ConnectionDiagnostics: @unchecked Sendable {
     }
     private var _protocolTrace: ProtocolTrace = ProtocolTrace()
 
+    /// ServerInit 名字段的字节数。不含字段内容。
+    public var serverInitNameFieldLength: Int? {
+        get { withLock { _serverInitNameFieldLength } }
+        set { withLock { _serverInitNameFieldLength = newValue } }
+    }
+    private var _serverInitNameFieldLength: Int?
+
+    /// 名字段前 6 字节的十六进制。后面的桌面名不在这里。
+    public var serverInitPrefixHex: String? {
+        get { withLock { _serverInitPrefixHex } }
+        set { withLock { _serverInitPrefixHex = newValue } }
+    }
+    private var _serverInitPrefixHex: String?
+
     // MARK: - Init
 
     /// Create a new connection diagnostics instance.
@@ -139,6 +156,8 @@ public final class ConnectionDiagnostics: @unchecked Sendable {
         _handshakeCompleteTime = nil
         _lastError = nil
         _protocolTrace = ProtocolTrace()
+        _serverInitNameFieldLength = nil
+        _serverInitPrefixHex = nil
     }
 
     /// Generate a human-readable summary of the connection diagnostics.

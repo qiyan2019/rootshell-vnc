@@ -739,6 +739,12 @@ final class OrderedMediaPacketCoalescer: @unchecked Sendable {
 /// `isLockScreen` is flag 0x08 and `isLoginWindow` is flag 0x10. This is the
 /// only session-state surface hosts need for text routing; curtain and console
 /// flags are not included.
+public enum VNCLoginPasswordDelivery: Sendable {
+    case delivered
+    case stopped
+    case notSent
+}
+
 public struct VNCRemoteLoginSurface: Sendable, Equatable {
     public var isLockScreen: Bool
     public var isLoginWindow: Bool
@@ -1011,6 +1017,9 @@ public final class VNCSession {
     private var appleLoginVisionGeneration: UInt64 = 0
     @ObservationIgnored
     private var appleLoginVisionDetected = false
+    /// OCR 命中的密码行中心。归一化，原点在左下。任何会话状态公告都会清掉。
+    @ObservationIgnored
+    private var passwordLineCenter: CGPoint?
     @ObservationIgnored
     private var appleLoginVisionPromptOffered = false
     @ObservationIgnored
@@ -1508,6 +1517,9 @@ public final class VNCSession {
 
     // MARK: - Input Events
 
+    /// OCR 判出登录界面。权威的会话公告不会清掉这个值。
+    public var remoteLoginVisionDetected: Bool { appleLoginVisionDetected }
+
     /// Whether the active connection has a password available for the remote
     /// login window. The password itself is intentionally never exposed.
     public var canSendLoginPassword: Bool {
@@ -1558,6 +1570,69 @@ public final class VNCSession {
             return
         }
 
+        queueLoginPasswordUntilDisplayIsStable()
+    }
+
+    /// 逐事件投递密码。`.pause` 在这里等，不进输入队列。
+    /// 距上次检查满 100ms 就问一次 `shouldContinue`，返回 false 立刻停。
+    ///
+    /// 高性能 Match Client 走现有的稳定闸，这次调用还没把键写出去，也不是拒绝。
+    /// 枚举里没有「已排队」，返回 `.delivered` 表示请求被闸接受，画面稳定后由
+    /// `sendLoginPasswordNow` 发出。`lastLoginPasswordDeliveryNanos` 仍只在真正
+    /// 开写时记下。标准模式走不到这条。
+    public func sendLoginPassword(
+        shouldContinue: @escaping @MainActor () -> Bool
+    ) async -> VNCLoginPasswordDelivery {
+        guard !isViewOnly else { return .notSent }
+        guard canSendLoginPassword,
+              let password = activeCredentials?.password,
+              connectionState.isConnected,
+              transportSession != nil else { return .notSent }
+
+        if shouldDeferLoginPasswordForMatchClientStability {
+            queueLoginPasswordUntilDisplayIsStable()
+            return .delivered
+        }
+
+        logger.info("Sending approved login password input")
+        lastLoginPasswordDeliveryNanos = DispatchTime.now().uptimeNanoseconds
+        let focus = Self.loginPasswordClickPoint(
+            passwordLineCenter: passwordLineCenter,
+            framebufferWidth: framebufferWidth,
+            framebufferHeight: framebufferHeight)
+        let events = Self.loginPasswordFocusInputEvents(x: focus.x, y: focus.y)
+            + Self.loginPasswordInputEvents(password: password)
+        var lastCheckNanos = DispatchTime.now().uptimeNanoseconds
+        for event in events {
+            guard connectionState.isConnected, transportSession != nil else {
+                return .stopped
+            }
+            let now = DispatchTime.now().uptimeNanoseconds
+            if now &- lastCheckNanos >= Self.loginPasswordContinueCheckNanos {
+                lastCheckNanos = now
+                if !shouldContinue() { return .stopped }
+            }
+            switch event {
+            case .pause(let nanoseconds):
+                do {
+                    try await Task.sleep(nanoseconds: nanoseconds)
+                } catch {
+                    return .stopped
+                }
+            case .key(let downFlag, let keysym):
+                sendKeyEvent(downFlag: downFlag, key: keysym)
+            case .pointer(let buttonMask, let x, let y):
+                sendPointerEvent(buttonMask: buttonMask, x: x, y: y)
+            case .scroll, .gesture, .clipboard, .clipboardRequest,
+                 .pasteText, .pasteDeviceText, .sharedClipboard, .curtain:
+                break
+            }
+        }
+        return .delivered
+    }
+
+    /// Match Client 还在换显示时，把已确认的发送交给稳定闸。不写投递时间。
+    private func queueLoginPasswordUntilDisplayIsStable() {
         let wasPending = loginPasswordSendGate.isPending
         let token = loginPasswordSendGate.requestSend()
         if let token {
@@ -1575,9 +1650,11 @@ public final class VNCSession {
         logger.info("Sending approved login password input")
         lastLoginPasswordDeliveryNanos = DispatchTime.now().uptimeNanoseconds
 
-        let focusX = UInt16(clamping: framebufferWidth / 2)
-        let focusY = UInt16(clamping: framebufferHeight / 2)
-        let events = Self.loginPasswordFocusInputEvents(x: focusX, y: focusY)
+        let focus = Self.loginPasswordClickPoint(
+            passwordLineCenter: passwordLineCenter,
+            framebufferWidth: framebufferWidth,
+            framebufferHeight: framebufferHeight)
+        let events = Self.loginPasswordFocusInputEvents(x: focus.x, y: focus.y)
             + Self.loginPasswordInputEvents(password: password)
         for event in events {
             switch event {
@@ -1655,6 +1732,25 @@ public final class VNCSession {
         }
         appendKeyTap(KeyboardInputHandler.keysymReturn)
         return events
+    }
+
+    /// 密码行中心是 Vision 的归一化坐标，原点在左下。指针的 y 向下，所以要翻转。
+    /// 没有坐标时点帧中心。
+    nonisolated static func loginPasswordClickPoint(
+        passwordLineCenter: CGPoint?,
+        framebufferWidth: Int,
+        framebufferHeight: Int
+    ) -> (x: UInt16, y: UInt16) {
+        guard let passwordLineCenter,
+              framebufferWidth > 0,
+              framebufferHeight > 0 else {
+            return (
+                UInt16(clamping: framebufferWidth / 2),
+                UInt16(clamping: framebufferHeight / 2))
+        }
+        let x = Int((passwordLineCenter.x * CGFloat(framebufferWidth)).rounded())
+        let y = Int(((1 - passwordLineCenter.y) * CGFloat(framebufferHeight)).rounded())
+        return (UInt16(clamping: x), UInt16(clamping: y))
     }
 
     /// 只看。默认关，和上游一样把输入发给远端。
@@ -1845,22 +1941,25 @@ public final class VNCSession {
     }
 
     /// 锁屏或登录窗上推出去的文字。解锁后再写一次，因为锁屏时写入能不能留下没有依据。
-    /// 没连上时不记。不写入日志。
+    /// 还没收到会话状态公告时也先记下：未知按可能锁屏。没连上时不发，留到下一次公告。
+    /// 不写入日志。
     var clipboardReplayOnUnlock: String?
     private var isReplayingClipboardAfterUnlock = false
 
     func noteClipboardForUnlockReplay(_ text: String) {
         if isReplayingClipboardAfterUnlock { return }
-        if remoteLoginSurface.isLockScreen || remoteLoginSurface.isLoginWindow {
+        let sessionStateUnknown = lastSessionStateAnnouncementNanos == 0
+        if sessionStateUnknown
+            || remoteLoginSurface.isLockScreen
+            || remoteLoginSurface.isLoginWindow {
             clipboardReplayOnUnlock = text
         } else {
             clipboardReplayOnUnlock = nil
         }
     }
 
-    /// 只有当时明确处在锁屏或登录窗、并且现在两边都不是，才再写一次。
-    /// 没连上就留着，等这条连接回到 `.connected`。两边都没公告过（默认 false）
-    /// 不当成锁屏，否则每次推送都会被攒下来。
+    /// 从锁屏或「还没公告过」变成明确未锁屏时补写一次。
+    /// 没连上就留着，等下一次未锁屏公告。补写只发一次：发出去就把待重发清掉。
     private func replayClipboardAfterUnlockIfPossible() {
         guard let pending = clipboardReplayOnUnlock else { return }
         guard !remoteLoginSurface.isLockScreen,
@@ -2123,6 +2222,8 @@ public final class VNCSession {
             negotiatedContentEncryption = handshake.contentEncryption
         }
         serverCapabilities = handshake.appleServerCapabilities
+        diagnostics.serverInitNameFieldLength = handshake.serverInitNameFieldLength
+        diagnostics.serverInitPrefixHex = handshake.serverInitPrefixHex
         let usesAppleModifiers = configuration.remoteSystem.usesAppleModifiers(
             isAppleProtocol: handshake.negotiatedVersion?.isApple == true,
             offeredSecurityTypes: handshake.offeredSecurityTypes)
@@ -3019,7 +3120,10 @@ public final class VNCSession {
     func handleAppleRemoteSessionState(
         _ state: AppleRemoteSessionState
     ) {
+        let hadSessionStateAnnouncement = lastSessionStateAnnouncementNanos != 0
         lastSessionStateAnnouncementNanos = DispatchTime.now().uptimeNanoseconds
+        // 公告只说明会话标志，密码行坐标是上一帧 OCR 的，不能留。
+        passwordLineCenter = nil
         let wasLocked = remoteLoginSurface.isLockScreen
             || remoteLoginSurface.isLoginWindow
         remoteLoginSurface = VNCRemoteLoginSurface(
@@ -3027,7 +3131,10 @@ public final class VNCSession {
             isLoginWindow: state.loginWindowActive)
         let nowLocked = remoteLoginSurface.isLockScreen
             || remoteLoginSurface.isLoginWindow
-        if wasLocked, !nowLocked {
+        // 未知到未锁屏、锁屏到未锁屏都补写。第一次公告时还没连上就留着，
+        // 后面仍是未锁屏的公告再试，发出去才清，所以只发一次。
+        if !nowLocked,
+           wasLocked || !hadSessionStateAnnouncement || clipboardReplayOnUnlock != nil {
             replayClipboardAfterUnlockIfPossible()
         }
         applyCurtainState(state)
@@ -3086,6 +3193,7 @@ public final class VNCSession {
         appleLoginVisionLastAttemptNanos = 0
         appleLoginVisionGeneration &+= 1
         appleLoginVisionDetected = false
+        passwordLineCenter = nil
         appleLoginVisionPromptOffered = false
         appleLoginVisionHighPerformanceGeneration = nil
         appleServerProtocolObserved = false
@@ -3137,6 +3245,8 @@ public final class VNCSession {
     private static let loginPasswordPromptRecheckDelay =
         Duration.milliseconds(2_500)
     private static let loginPasswordPromptRecheckMaxRounds = 4
+    /// 投递途中两次询问 `shouldContinue` 的最小间隔。
+    private static let loginPasswordContinueCheckNanos: UInt64 = 100_000_000
 
     /// The first committed frame of a replacement generation restarts the
     /// quiet clock: the visible content just changed wholesale, even when no
@@ -3266,9 +3376,16 @@ public final class VNCSession {
             }
             guard let self, !Task.isCancelled else { return }
             self.loginPasswordPromptRecheckTask = nil
-            self.logger.info(
-                "No fresh session-state evidence arrived after the "
-                    + "delivery; staying silent (\(source))")
+            if self.appleLoginPromptTracker.isLoginActive {
+                self.loginPasswordPromptPending = true
+                self.logger.info(
+                    "Login prompt offered after recheck rounds; login "
+                        + "state is still active (\(source))")
+            } else {
+                self.logger.info(
+                    "No fresh session-state evidence arrived after the "
+                        + "delivery; staying silent (\(source))")
+            }
         }
     }
 
@@ -3676,6 +3793,7 @@ public final class VNCSession {
 
             if analysis.isLoginScreen {
                 self.appleLoginVisionDetected = true
+                self.passwordLineCenter = analysis.passwordLineCenter
                 self.appleLoginVisionPromptOffered = true
                 if self.loginPasswordSendGate.isPending {
                     self.logger.info(
