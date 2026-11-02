@@ -270,9 +270,11 @@ public struct RemoteDesktopView: View {
                     Color.clear
                         .ignoresSafeArea()
 
+                    // GPU 呈现时缩放平移在着色器里做，只采样可见部分；
+                    // 这里再放大一次只会把已经画好的画面拉糊。
                     desktopContent(in: geometry.size)
-                        .scaleEffect(viewport.scale)
-                        .offset(viewport.offset)
+                        .scaleEffect(usesFramebufferGPUPresentation ? 1 : viewport.scale)
+                        .offset(usesFramebufferGPUPresentation ? .zero : viewport.offset)
 
                     if session.connectionState.isConnected,
                        framebufferSize.width > 0,
@@ -415,6 +417,18 @@ public struct RemoteDesktopView: View {
         #endif
     }
 
+    /// 标准帧缓冲走 GPU 呈现。亮度增益（EDR）和高性能模式有各自的路径。
+    private var usesFramebufferGPUPresentation: Bool {
+        #if canImport(UIKit)
+        !session.isHighPerformanceMode
+            && brightnessGain <= 1
+            && session.usesFramebufferGPUPresentation
+            && FramebufferMetalHostView.isAvailable
+        #else
+        false
+        #endif
+    }
+
     @ViewBuilder
     private func desktopContent(in viewSize: CGSize) -> some View {
         if session.isHighPerformanceMode {
@@ -433,7 +447,9 @@ public struct RemoteDesktopView: View {
             StandardFramebufferContent(
                 session: session,
                 showsWaitingCard: !hostOwnsRecoveryChrome,
-                brightnessGain: brightnessGain)
+                brightnessGain: brightnessGain,
+                viewport: viewport,
+                usesGPUPresentation: usesFramebufferGPUPresentation)
                 .frame(width: viewSize.width, height: viewSize.height)
         }
     }
@@ -1271,8 +1287,27 @@ private struct StandardFramebufferContent: View {
     /// False when the host renders its own connected-but-no-frame prompt.
     let showsWaitingCard: Bool
     let brightnessGain: Double
+    let viewport: RemoteViewportState
+    let usesGPUPresentation: Bool
 
     var body: some View {
+        #if canImport(UIKit)
+        if usesGPUPresentation, session.hasPublishedFramebufferImage {
+            FramebufferMetalContent(
+                session: session,
+                viewport: viewport,
+                sourceRegion: session.presentedFramebufferRegion)
+                .allowsHitTesting(false)
+        } else {
+            imageContent
+        }
+        #else
+        imageContent
+        #endif
+    }
+
+    @ViewBuilder
+    private var imageContent: some View {
         if let image = session.currentImage {
             let displayedImage = cropped(image) ?? image
             Image(decorative: displayedImage, scale: 1)

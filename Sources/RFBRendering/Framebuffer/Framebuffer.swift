@@ -1,8 +1,105 @@
 import Foundation
 import CoreGraphics
+import IOSurface
 import RFBProtocol
 
-/// Thread-safe framebuffer backed by a CGContext.
+/// 一块帧缓冲内存。32 位帧缓冲放在 IOSurface 里，GPU 能直接把它当纹理读（零拷贝）。
+/// 选 IOSurface 而不是共享 MTLBuffer 上的线性纹理：后者在模拟器里不支持
+/// （驱动报 "Linear texture can only be created on buffers with MTLStorageModePrivate"），
+/// 用 IOSurface 时真机和模拟器走同一条路径。
+/// 单独成类是为了引用计数：resize 换内存时，纹理和正在读它的 GPU 命令还持有旧的这块。
+public final class FramebufferStorage: @unchecked Sendable {
+    /// 有值时可以映射成纹理。16 位帧缓冲或超大尺寸没有，走图片路径。
+    public let surface: IOSurfaceRef?
+    public let base: UnsafeMutableRawPointer
+    public let byteCount: Int
+    public let bytesPerRow: Int
+
+    /// 超过这个尺寸不建 IOSurface。Apple GPU 的纹理边长上限（iOS 18 能跑的设备都是 16384）。
+    public static let maximumSurfaceDimension = 16_384
+    /// 行距对齐。线性纹理和 IOSurface 的要求都不超过 256 字节。
+    public static let rowAlignment = 256
+
+    private let mappedLength: Int
+
+    init(width: Int, height: Int, bytesPerPixel: Int) {
+        let unalignedRow = width * bytesPerPixel
+        let alignedRow = (unalignedRow + Self.rowAlignment - 1)
+            / Self.rowAlignment * Self.rowAlignment
+        let length = alignedRow * height
+        bytesPerRow = alignedRow
+
+        if bytesPerPixel == 4,
+           max(width, height) <= Self.maximumSurfaceDimension,
+           let surface = Self.makeSurface(
+            width: width, height: height, bytesPerRow: alignedRow, byteCount: length) {
+            self.surface = surface
+            IOSurfaceLock(surface, [], nil)
+            base = IOSurfaceGetBaseAddress(surface)
+            byteCount = IOSurfaceGetAllocSize(surface)
+            // 从黑屏开始。
+            memset(base, 0, byteCount)
+            IOSurfaceUnlock(surface, [], nil)
+            mappedLength = 0
+            return
+        }
+
+        surface = nil
+        // 匿名映射由内核清零，从黑屏开始。
+        let pageSize = Int(getpagesize())
+        let mapped = max(pageSize, (length + pageSize - 1) / pageSize * pageSize)
+        let pointer = mmap(nil, mapped, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0)
+        guard let pointer, pointer != MAP_FAILED else {
+            fatalError("Framebuffer allocation of \(mapped) bytes failed")
+        }
+        base = pointer
+        byteCount = mapped
+        mappedLength = mapped
+    }
+
+    deinit {
+        if mappedLength > 0 {
+            munmap(base, mappedLength)
+        }
+    }
+
+    private static func makeSurface(
+        width: Int, height: Int, bytesPerRow: Int, byteCount: Int
+    ) -> IOSurfaceRef? {
+        let properties: [CFString: Any] = [
+            kIOSurfaceWidth: width,
+            kIOSurfaceHeight: height,
+            kIOSurfaceBytesPerElement: 4,
+            kIOSurfaceBytesPerRow: bytesPerRow,
+            kIOSurfaceAllocSize: byteCount,
+            // 'BGRA'：帧缓冲的内存顺序是 B、G、R、X。
+            kIOSurfacePixelFormat: 0x4247_5241 as UInt32,
+        ]
+        return IOSurfaceCreate(properties as CFDictionary)
+    }
+
+    /// 碰内存前后必须成对调用（IOSurface 的合同）。
+    func beginAccess(readOnly: Bool) {
+        guard let surface else { return }
+        IOSurfaceLock(surface, readOnly ? .readOnly : [], nil)
+    }
+
+    func endAccess(readOnly: Bool) {
+        guard let surface else { return }
+        IOSurfaceUnlock(surface, readOnly ? .readOnly : [], nil)
+    }
+}
+
+/// 呈现层读帧缓冲需要的全部信息，取的时候是一致的一份。
+public struct FramebufferPresentationStorage: Sendable {
+    public let storage: FramebufferStorage
+    public let width: Int
+    public let height: Int
+    public let bytesPerRow: Int
+    public let bytesPerPixel: Int
+}
+
+/// Thread-safe framebuffer backed by memory the GPU can read directly.
 /// Uses NSLock (not actor) for synchronous read access from the render path.
 public final class Framebuffer: @unchecked Sendable {
 
@@ -16,8 +113,8 @@ public final class Framebuffer: @unchecked Sendable {
     // MARK: - Private state
 
     private let lock = NSLock()
+    private var storage: FramebufferStorage
     private var pixelData: UnsafeMutableRawPointer
-    private var context: CGContext
     private let colorSpace: CGColorSpace
     private let bitmapInfo: UInt32
     private let bitsPerComponent: Int
@@ -39,7 +136,10 @@ public final class Framebuffer: @unchecked Sendable {
         self.width = width
         self.height = height
         self.bytesPerPixel = pixelFormat.bytesPerPixel
-        self.bytesPerRow = width * pixelFormat.bytesPerPixel
+        self.storage = FramebufferStorage(
+            width: width, height: height, bytesPerPixel: pixelFormat.bytesPerPixel)
+        self.bytesPerRow = storage.bytesPerRow
+        self.pixelData = storage.base
         self.colorSpace = CGColorSpaceCreateDeviceRGB()
 
         if pixelFormat.bytesPerPixel == 2 {
@@ -56,27 +156,6 @@ public final class Framebuffer: @unchecked Sendable {
             self.bitsPerComponent = 8
         }
 
-        let byteCount = bytesPerRow * height
-        self.pixelData = UnsafeMutableRawPointer.allocate(
-            byteCount: byteCount,
-            alignment: MemoryLayout<UInt32>.alignment
-        )
-        // Zero-fill so we start with a black framebuffer
-        pixelData.initializeMemory(as: UInt8.self, repeating: 0, count: byteCount)
-
-        self.context = CGContext(
-            data: pixelData,
-            width: width,
-            height: height,
-            bitsPerComponent: bitsPerComponent,
-            bytesPerRow: bytesPerRow,
-            space: colorSpace,
-            bitmapInfo: bitmapInfo
-        )!
-    }
-
-    deinit {
-        pixelData.deallocate()
     }
 
     // MARK: - Write operations
@@ -96,6 +175,8 @@ public final class Framebuffer: @unchecked Sendable {
     ) rethrows -> Result {
         lock.lock()
         defer { lock.unlock() }
+        storage.beginAccess(readOnly: false)
+        defer { storage.endAccess(readOnly: false) }
         return try body(pixelData, width, height, bytesPerRow, bytesPerPixel)
     }
 
@@ -105,6 +186,8 @@ public final class Framebuffer: @unchecked Sendable {
 
         lock.lock()
         defer { lock.unlock() }
+        storage.beginAccess(readOnly: false)
+        defer { storage.endAccess(readOnly: false) }
 
         let srcBytesPerRow = w * bytesPerPixel
         data.withUnsafeBytes { srcBuffer in
@@ -136,6 +219,8 @@ public final class Framebuffer: @unchecked Sendable {
 
         lock.lock()
         defer { lock.unlock() }
+        storage.beginAccess(readOnly: false)
+        defer { storage.endAccess(readOnly: false) }
 
         // Clip to framebuffer bounds to prevent out-of-bounds access
         let clippedW = min(w, min(width - srcX, width - dstX))
@@ -182,6 +267,8 @@ public final class Framebuffer: @unchecked Sendable {
 
         lock.lock()
         defer { lock.unlock() }
+        storage.beginAccess(readOnly: false)
+        defer { storage.endAccess(readOnly: false) }
 
         pixel.withUnsafeBytes { pixelBuffer in
             guard let pixelBase = pixelBuffer.baseAddress else { return }
@@ -219,16 +306,58 @@ public final class Framebuffer: @unchecked Sendable {
     // MARK: - Read operations
 
     /// Create a CGImage snapshot of the current framebuffer. Thread-safe.
+    ///
+    /// 显式拷贝，不用 `CGContext.makeImage()`：后者走写时复制，下一次写要逐页缺页，
+    /// 而这块内存同时映射给了 GPU，不能让页表被这样换来换去。
     public func createImage() -> CGImage? {
         lock.lock()
         defer { lock.unlock() }
-        return context.makeImage()
+        storage.beginAccess(readOnly: true)
+        defer { storage.endAccess(readOnly: true) }
+        let byteCount = bytesPerRow * height
+        guard let copy = malloc(byteCount) else { return nil }
+        memcpy(copy, pixelData, byteCount)
+        guard let provider = CGDataProvider(
+            dataInfo: nil,
+            data: copy,
+            size: byteCount,
+            releaseData: { _, data, _ in free(UnsafeMutableRawPointer(mutating: data)) })
+        else {
+            free(copy)
+            return nil
+        }
+        return CGImage(
+            width: width,
+            height: height,
+            bitsPerComponent: bitsPerComponent,
+            bitsPerPixel: bytesPerPixel * 8,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: CGBitmapInfo(rawValue: bitmapInfo),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: true,
+            intent: .defaultIntent)
+    }
+
+    /// 呈现层取当前内存。持有返回值期间这块内存不会被释放，resize 只会换新的。
+    public func presentationStorage() -> FramebufferPresentationStorage {
+        lock.lock()
+        defer { lock.unlock() }
+        return FramebufferPresentationStorage(
+            storage: storage,
+            width: width,
+            height: height,
+            bytesPerRow: bytesPerRow,
+            bytesPerPixel: bytesPerPixel)
     }
 
     /// Get the raw pixel data for a region (for testing). Thread-safe.
     public func getPixels(x: Int, y: Int, width w: Int, height h: Int) -> Data {
         lock.lock()
         defer { lock.unlock() }
+        storage.beginAccess(readOnly: true)
+        defer { storage.endAccess(readOnly: true) }
 
         let rowBytes = w * bytesPerPixel
         var result = Data(capacity: rowBytes * h)
@@ -272,14 +401,11 @@ public final class Framebuffer: @unchecked Sendable {
 
         guard newWidth != width || newHeight != height else { return }
 
-        let newBytesPerRow = newWidth * bytesPerPixel
-        let newByteCount = newBytesPerRow * newHeight
-
-        let newPixelData = UnsafeMutableRawPointer.allocate(
-            byteCount: newByteCount,
-            alignment: MemoryLayout<UInt32>.alignment
-        )
-        newPixelData.initializeMemory(as: UInt8.self, repeating: 0, count: newByteCount)
+        let newStorage = FramebufferStorage(
+            width: newWidth, height: newHeight, bytesPerPixel: bytesPerPixel)
+        let newBytesPerRow = newStorage.bytesPerRow
+        storage.beginAccess(readOnly: true)
+        newStorage.beginAccess(readOnly: false)
 
         // Copy existing pixel data that fits within the new dimensions
         let copyWidth = min(width, newWidth)
@@ -290,29 +416,20 @@ public final class Framebuffer: @unchecked Sendable {
             let srcOffset = row * bytesPerRow
             let dstOffset = row * newBytesPerRow
             memcpy(
-                newPixelData.advanced(by: dstOffset),
+                newStorage.base.advanced(by: dstOffset),
                 pixelData.advanced(by: srcOffset),
                 copyRowBytes
             )
         }
 
-        // Free old buffer
-        pixelData.deallocate()
+        newStorage.endAccess(readOnly: false)
+        storage.endAccess(readOnly: true)
 
-        // Update state
-        pixelData = newPixelData
+        // 旧内存交给引用计数：GPU 还在读时由纹理继续持有。
+        storage = newStorage
+        pixelData = newStorage.base
         width = newWidth
         height = newHeight
         bytesPerRow = newBytesPerRow
-
-        context = CGContext(
-            data: pixelData,
-            width: newWidth,
-            height: newHeight,
-            bitsPerComponent: bitsPerComponent,
-            bytesPerRow: newBytesPerRow,
-            space: colorSpace,
-            bitmapInfo: bitmapInfo
-        )!
     }
 }

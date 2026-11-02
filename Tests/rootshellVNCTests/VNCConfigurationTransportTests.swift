@@ -1110,6 +1110,112 @@ final class VNCConfigurationTransportTests: XCTestCase {
         return update
     }
 
+    /// 挂上呈现器后，逐帧画面走纹理；整帧图只低频发布给缩略图和登录识别。
+    /// 没有呈现器时（无界面的使用方）行为不变，由本文件其余用例守着。
+    @MainActor
+    func testAttachedPresenterPresentsEveryBatchWhileImagesStayLowRate() async throws {
+        guard let presenter = FramebufferMetalPresenter() else {
+            throw XCTSkip("没有可用的 Metal 设备")
+        }
+        let connection = SuccessfulRFBConnection(
+            name: "metal-presenter",
+            width: 8,
+            height: 8,
+            recordsFramebufferUpdateRequests: true)
+        var configuration = VNCConfiguration(
+            videoQualityMode: .standard,
+            reconnectionPolicy: VNCReconnectionPolicy(isEnabled: false, maximumAttempts: 0))
+        configuration.targetFrameRate = 120
+        configuration.transportProvider = { _, _ in connection }
+        let session = VNCSession(configuration: configuration)
+        try await session.connect(credentials: VNCCredentials(
+            host: "metal.test", port: 5900, password: ""))
+        var completed = await waitUntil { session.connectionState.isConnected }
+        XCTAssertTrue(completed)
+        XCTAssertFalse(session.hasPublishedFramebufferImage)
+
+        await connection.enqueueServerBytes(Self.rawFramebufferUpdate(
+            x: 0, y: 0, width: 8, height: 8, byte: 0x10))
+        completed = await waitUntil { session.currentImage != nil }
+        XCTAssertTrue(completed)
+        XCTAssertTrue(session.hasPublishedFramebufferImage)
+
+        session.attachFramebufferPresenter(presenter)
+        let firstImage = try XCTUnwrap(session.currentImage)
+        let imageClock = ContinuousClock.now
+        var lastByte: UInt8 = 0x10
+        for index in 1...3 {
+            try await Task.sleep(for: .milliseconds(20))
+            let requests = await connection.framebufferUpdateRequestCount()
+            lastByte = 0x10 + UInt8(index)
+            await connection.enqueueServerBytes(Self.rawFramebufferUpdate(
+                x: 0, y: 0, width: 8, height: 8, byte: lastByte))
+            completed = await waitForFramebufferRequest(after: requests, on: connection)
+            XCTAssertTrue(completed)
+        }
+        completed = await waitUntil { presenter.presentRequestCount >= 3 }
+        XCTAssertTrue(completed, "每批到期的画面都要交给呈现器")
+        // 机器卡顿超过低频周期时跳过这条断言，避免把调度抖动当成回归。
+        if imageClock.duration(to: .now) < .milliseconds(350) {
+            XCTAssertTrue(session.currentImage === firstImage, "低频周期内不该再发整帧图")
+        }
+
+        // 突发结束后，最后的状态必须落到图片上（缩略图、登录识别读它）。
+        completed = await waitUntil { session.currentImage !== firstImage }
+        XCTAssertTrue(completed, "尾帧图片没有发布")
+        let image = try XCTUnwrap(session.currentImage)
+        let data = try XCTUnwrap(image.dataProvider?.data as Data?)
+        XCTAssertEqual(data[data.startIndex], lastByte)
+
+        // 摘掉呈现器后恢复原来的发布节奏。
+        session.detachFramebufferPresenter(presenter)
+        XCTAssertNil(session.framebufferPresenter)
+        session.disconnect()
+        XCTAssertFalse(session.hasPublishedFramebufferImage)
+    }
+
+    /// 暂停呈现（后台、页面关闭）时不能碰 GPU，恢复后补一帧。
+    @MainActor
+    func testSuspendingPresentationGatesPresenter() async throws {
+        guard let presenter = FramebufferMetalPresenter() else {
+            throw XCTSkip("没有可用的 Metal 设备")
+        }
+        let connection = SuccessfulRFBConnection(
+            name: "metal-suspend",
+            width: 8,
+            height: 8,
+            recordsFramebufferUpdateRequests: true)
+        var configuration = VNCConfiguration(
+            videoQualityMode: .standard,
+            reconnectionPolicy: VNCReconnectionPolicy(isEnabled: false, maximumAttempts: 0))
+        configuration.transportProvider = { _, _ in connection }
+        let session = VNCSession(configuration: configuration)
+        try await session.connect(credentials: VNCCredentials(
+            host: "metal.test", port: 5900, password: ""))
+        var completed = await waitUntil { session.connectionState.isConnected }
+        XCTAssertTrue(completed)
+        await connection.enqueueServerBytes(Self.rawFramebufferUpdate(
+            x: 0, y: 0, width: 8, height: 8, byte: 0x10))
+        completed = await waitUntil { session.currentImage != nil }
+        XCTAssertTrue(completed)
+        session.attachFramebufferPresenter(presenter)
+
+        session.suspendsDisplayPresentation = true
+        let before = presenter.presentRequestCount
+        let requests = await connection.framebufferUpdateRequestCount()
+        await connection.enqueueServerBytes(Self.rawFramebufferUpdate(
+            x: 0, y: 0, width: 8, height: 8, byte: 0x20))
+        completed = await waitForFramebufferRequest(after: requests, on: connection)
+        XCTAssertTrue(completed)
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertEqual(presenter.presentRequestCount, before, "暂停期间不该发起呈现")
+
+        session.suspendsDisplayPresentation = false
+        completed = await waitUntil { presenter.presentRequestCount > before }
+        XCTAssertTrue(completed, "恢复后要补一帧")
+        session.disconnect()
+    }
+
     private static func desktopSizeFramebufferUpdate(
         width: UInt16,
         height: UInt16

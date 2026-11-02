@@ -787,7 +787,20 @@ public final class VNCSession {
     public var framebufferHeight: Int = 0
 
     /// The latest rendered framebuffer image, suitable for display.
-    public var currentImage: CGImage?
+    ///
+    /// 挂了 GPU 呈现器时，屏幕上的画面不走这里，这张图只低频更新
+    /// （`presentedImagePublishInterval`），给缩略图、登录识别这类读者用。
+    public var currentImage: CGImage? {
+        didSet {
+            let published = currentImage != nil
+            if published != hasPublishedFramebufferImage {
+                hasPublishedFramebufferImage = published
+            }
+        }
+    }
+
+    /// 是否已有可显示的画面。界面只关心有没有时读它，不会被每次换图打扰。
+    private(set) var hasPublishedFramebufferImage = false
 
     /// The last protocol error that occurred, if any.
     public var lastError: VNCProtocolError?
@@ -961,6 +974,7 @@ public final class VNCSession {
             guard oldValue != suspendsDisplayPresentation else { return }
             videoBandRenderer.setPresentationSuspended(suspendsDisplayPresentation)
             secondaryVideoBandRenderer.setPresentationSuspended(suspendsDisplayPresentation)
+            framebufferPresenter?.setPresentationAllowed(!suspendsDisplayPresentation)
             if !suspendsDisplayPresentation, renderer != nil {
                 scheduleTrailingSnapshot(interval: 0)
             }
@@ -975,6 +989,7 @@ public final class VNCSession {
     /// which on a static remote screen never comes.
     public func reconcileDisplayPresentation() {
         suspendsDisplayPresentation = false
+        framebufferPresenter?.setPresentationAllowed(true)
         videoBandRenderer.presentPendingBandsIfAny()
         secondaryVideoBandRenderer.presentPendingBandsIfAny()
         if renderer != nil, trailingSnapshotTask == nil {
@@ -1146,6 +1161,18 @@ public final class VNCSession {
     private var lastImagePublishNanos: UInt64 = 0
     @ObservationIgnored
     private var trailingSnapshotTask: Task<Void, Never>?
+    /// 把帧缓冲直接画到屏幕的呈现器，由视图挂载。nil 时画面走 `currentImage`。
+    @ObservationIgnored
+    private(set) var framebufferPresenter: FramebufferMetalPresenter?
+    /// 上一次把一批画面交给呈现器的时间，控制 GPU 呈现节奏。
+    @ObservationIgnored
+    private var lastFramePresentNanos: UInt64 = 0
+    /// 一批画面没赶上节奏时，由它在节奏点补上，保证最后的状态上屏。
+    @ObservationIgnored
+    private var trailingFramePresentTask: Task<Void, Never>?
+    /// 挂了呈现器后整帧图的发布间隔。每张都是一次整屏内存拷贝，所以尽量低；
+    /// 读者（缩略图、登录识别）只需要最近的大致画面。
+    private static let presentedImagePublishIntervalNanos: UInt64 = 500_000_000
     @ObservationIgnored
     private var initialFramePresentationTracker =
         StandardInitialFramePresentationTracker()
@@ -2540,8 +2567,13 @@ public final class VNCSession {
         // full-framebuffer snapshot + image publish is capped at
         // targetFrameRate. A trailing snapshot guarantees the final state
         // always renders after a burst.
-        let publishInterval = UInt64(
+        let frameInterval = UInt64(
             1_000_000_000 / max(1, configuration.targetFrameRate))
+        // 挂了呈现器时屏幕不靠这张图，图只低频发布。
+        let presenter = framebufferPresenter
+        let publishInterval = presenter == nil
+            ? frameInterval
+            : max(frameInterval, Self.presentedImagePublishIntervalNanos)
         let renderStarted = DispatchTime.now().uptimeNanoseconds
         let publishDue = renderStarted &- lastImagePublishNanos >= publishInterval
         let carriesFramebufferPixels = StandardFramebufferPresentationPolicy
@@ -2558,12 +2590,23 @@ public final class VNCSession {
             && carriesFramebufferPixels
             && initialFramePresentationAllowed
             && !displaySuspended
+        let framePresentable = carriesFramebufferPixels
+            && initialFramePresentationAllowed
+            && !displaySuspended
+        let framePresenter = framePresentable
+            && renderStarted &- lastFramePresentNanos >= frameInterval
+            ? presenter : nil
+        let presentedFramebuffer = framebuffer
         let result = await withCheckedContinuation { continuation in
             framebufferRenderQueue.async {
-                continuation.resume(
-                    returning: renderer.applyBatch(
-                        renderRects,
-                        snapshot: takeSnapshot))
+                let result = renderer.applyBatch(
+                    renderRects,
+                    snapshot: takeSnapshot)
+                // 在解码队列上画并等 GPU 读完：下一批写入不会混进这一帧。
+                if let framePresenter, let presentedFramebuffer {
+                    framePresenter.presentFrame(from: presentedFramebuffer)
+                }
+                continuation.resume(returning: result)
             }
         }
         // The old renderer must finish its serial codec work, but a transport
@@ -2575,6 +2618,13 @@ public final class VNCSession {
             standardFramebufferHasPresentablePixels = true
         }
         let renderFinished = DispatchTime.now().uptimeNanoseconds
+        if framePresenter != nil {
+            trailingFramePresentTask?.cancel()
+            trailingFramePresentTask = nil
+            lastFramePresentNanos = renderFinished
+        } else if framePresentable, presenter != nil {
+            scheduleTrailingFramePresent(interval: frameInterval)
+        }
         let renderMilliseconds = (renderFinished &- renderStarted) / 1_000_000
         if renderMilliseconds >= 100,
            (lastFramebufferRenderDiagnosticNanos == 0
@@ -4108,6 +4158,69 @@ public final class VNCSession {
         }
     }
 
+    // MARK: - GPU 呈现
+
+    /// 视图挂上呈现器。之后逐帧画面走纹理，`currentImage` 转为低频。
+    func attachFramebufferPresenter(_ presenter: FramebufferMetalPresenter) {
+        framebufferPresenter = presenter
+        presenter.setPresentationAllowed(
+            !suspendsDisplayPresentation && !VNCPresentationPolicy.isPresentationProhibited())
+        if let framebuffer {
+            presenter.setFramebuffer(framebuffer)
+        }
+        presenter.requestRedraw()
+    }
+
+    func detachFramebufferPresenter(_ presenter: FramebufferMetalPresenter) {
+        guard framebufferPresenter === presenter else { return }
+        framebufferPresenter = nil
+        trailingFramePresentTask?.cancel()
+        trailingFramePresentTask = nil
+    }
+
+    /// 实际提交给 GPU 的帧数（性能基准用）。
+    public var framebufferFramesPresented: Int {
+        framebufferPresenter?.framesPresentedCount ?? 0
+    }
+
+    /// 这一连接能否走 GPU 呈现。16 位千色和超过纹理上限的桌面继续走图片路径。
+    var usesFramebufferGPUPresentation: Bool {
+        FramebufferMetalPresenter.supports(pixelFormat: configuration.effectivePixelFormat)
+            && max(framebufferWidth, framebufferHeight)
+                <= FramebufferStorage.maximumSurfaceDimension
+    }
+
+    /// 没赶上节奏的画面在下一个节奏点补上。连续到来的批次共用一个任务。
+    private func scheduleTrailingFramePresent(interval: UInt64) {
+        guard trailingFramePresentTask == nil,
+              !initialFramePresentationTracker.suppressesPresentation,
+              standardFramebufferHasPresentablePixels,
+              let renderer, let framebuffer, let presenter = framebufferPresenter else { return }
+        let presentationGeneration = framebufferPresentationGeneration
+        let cadenceDelay = interval &- min(
+            interval,
+            DispatchTime.now().uptimeNanoseconds &- lastFramePresentNanos)
+        trailingFramePresentTask = Task { [weak self] in
+            try? await Task.sleep(for: .nanoseconds(Int64(cadenceDelay)))
+            guard let self, !Task.isCancelled else { return }
+            self.trailingFramePresentTask = nil
+            guard self.framebufferPresentationGeneration == presentationGeneration,
+                  self.renderer === renderer,
+                  self.framebufferPresenter === presenter,
+                  !self.initialFramePresentationTracker.suppressesPresentation,
+                  !self.suspendsDisplayPresentation,
+                  !VNCPresentationPolicy.isPresentationProhibited() else { return }
+            self.lastFramePresentNanos = DispatchTime.now().uptimeNanoseconds
+            let queue = self.framebufferRenderQueue
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                queue.async {
+                    presenter.presentFrame(from: framebuffer)
+                    continuation.resume()
+                }
+            }
+        }
+    }
+
     private func scheduleTrailingSnapshot(interval: UInt64) {
         guard trailingSnapshotTask == nil,
               !initialFramePresentationTracker.suppressesPresentation,
@@ -4129,8 +4242,17 @@ public final class VNCSession {
                 return
             }
             let queue = self.framebufferRenderQueue
+            // 恢复呈现时（`suspendsDisplayPresentation` 清除）也走这里：解码一直在写内存，
+            // 挂起期间屏幕没更新，这里补上一帧。
+            let reconcilePresenter = self.suspendsDisplayPresentation
+                || VNCPresentationPolicy.isPresentationProhibited()
+                ? nil : self.framebufferPresenter
+            let reconcileFramebuffer = self.framebuffer
             let image = await withCheckedContinuation { continuation in
                 queue.async {
+                    if let reconcilePresenter, let reconcileFramebuffer {
+                        reconcilePresenter.presentFrame(from: reconcileFramebuffer)
+                    }
                     continuation.resume(returning: renderer.snapshot())
                 }
             }
@@ -4169,9 +4291,12 @@ public final class VNCSession {
         framebufferPresentationGeneration &+= 1
         trailingSnapshotTask?.cancel()
         trailingSnapshotTask = nil
+        trailingFramePresentTask?.cancel()
+        trailingFramePresentTask = nil
         initialFramePresentationTracker.reset()
         standardFramebufferHasPresentablePixels = false
         lastImagePublishNanos = 0
+        lastFramePresentNanos = 0
         deferredFramebufferRects.removeAll(keepingCapacity: true)
         deferredFramebufferBytes = 0
     }
