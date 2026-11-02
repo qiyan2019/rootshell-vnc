@@ -20,7 +20,7 @@ let package = Package(
         // Already used and resolved by the host application. RFBTransport
         // consumes these products directly for VeNCrypt STARTTLS rather than
         // introducing a second TLS/crypto implementation.
-        .package(url: "https://github.com/apple/swift-nio.git", exact: "2.95.0"),
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.95.0"),
         .package(url: "https://github.com/apple/swift-nio-ssl.git", exact: "2.36.0"),
         .package(url: "https://github.com/apple/swift-nio-transport-services.git", exact: "1.26.0"),
     ],
