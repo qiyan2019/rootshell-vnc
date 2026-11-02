@@ -382,7 +382,7 @@ private final class CompoundBandSurfaceCompositor {
         else { return nil }
 
         let outputBounds = CGRect(x: 0, y: 0, width: width, height: height)
-        var frame = CIImage(color: .black).cropped(to: outputBounds)
+        var frame = CIImage(color: .clear).cropped(to: outputBounds)
         var top = 0
 
         for (_, pixelBuffer) in bands.sorted(by: { $0.key < $1.key }) {
@@ -462,7 +462,7 @@ private final class BandHostView: UIView {
     init(renderer: VideoBandLayerRenderer) {
         self.renderer = renderer
         super.init(frame: .zero)
-        backgroundColor = .black
+        backgroundColor = .clear
         layer.addSublayer(renderer.containerLayer)
     }
 

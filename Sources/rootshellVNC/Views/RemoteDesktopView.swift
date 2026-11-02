@@ -265,7 +265,9 @@ public struct RemoteDesktopView: View {
                 let framebufferOrigin = session.presentedFramebufferRegion?.origin ?? .zero
 
                 ZStack {
-                    Color.black
+                    // 留黑透出宿主页底色（Android VncView 不刷底，同色）；
+                    // Agito 页底是深色主题色，与状态层/快捷键栏一种深色。
+                    Color.clear
                         .ignoresSafeArea()
 
                     desktopContent(in: geometry.size)
@@ -1345,7 +1347,7 @@ private struct AdaptiveDisplayView: View {
                 }
             }
         }
-        .background(Color.black)
+        .background(Color.clear)
     }
 
     private func videoDisplay(
