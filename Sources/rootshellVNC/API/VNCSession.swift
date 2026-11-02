@@ -1668,6 +1668,16 @@ public final class VNCSession {
 
     private var viewOnly = false
     private var heldInput = ViewOnlyHeldInput()
+    /// 这条连接最近发过的指针位置；还没发过时是 nil。
+    @ObservationIgnored
+    private var lastSentPointer: UnlockStimulusScheduler.Point?
+    @ObservationIgnored
+    private lazy var unlockStimulus = UnlockStimulusScheduler(
+        isLocked: { [weak self] in
+            guard let surface = self?.remoteLoginSurface else { return false }
+            return surface.isLockScreen || surface.isLoginWindow
+        },
+        fire: { [weak self] in self?.nudgePointer() })
 
     private func updateViewOnly(_ enabled: Bool) {
         guard enabled != viewOnly else { return }
@@ -1700,6 +1710,7 @@ public final class VNCSession {
         guard !isViewOnly else { return }
         guard connectionState.isConnected, transportSession != nil else { return }
         heldInput.noteKey(down: downFlag, keysym: key)
+        unlockStimulus.noteKey(down: downFlag, keysym: key)
 
         if isTraceEnabled {
             diagnostics.protocolTrace.recordSent(
@@ -1723,6 +1734,7 @@ public final class VNCSession {
         guard !isViewOnly else { return }
         guard connectionState.isConnected, transportSession != nil else { return }
         heldInput.notePointer(buttonMask: buttonMask, x: x, y: y)
+        lastSentPointer = UnlockStimulusScheduler.Point(x: x, y: y)
 
         if isTraceEnabled {
             diagnostics.protocolTrace.recordSent(
@@ -1733,6 +1745,22 @@ public final class VNCSession {
         }
 
         enqueueInput(.pointer(buttonMask: buttonMask, x: x, y: y))
+    }
+
+    /// 指针移 1 像素再移回：不按键，净坐标不变。屏保时能让 Mac 退出屏保，
+    /// 锁屏回车后能促服务端刷新画面（同 Android `sendPointerNudge`）。
+    public func nudgePointer() {
+        guard framebufferWidth > 0, framebufferHeight > 0 else { return }
+        let anchor = UnlockStimulusScheduler.anchor(
+            lastX: lastSentPointer?.x,
+            lastY: lastSentPointer?.y,
+            framebufferWidth: framebufferWidth,
+            framebufferHeight: framebufferHeight)
+        let points = UnlockStimulusScheduler.nudgePoints(
+            x: anchor.x, y: anchor.y, framebufferWidth: framebufferWidth)
+        for point in points {
+            sendPointerEvent(buttonMask: 0, x: point.x, y: point.y)
+        }
     }
 
     /// Send one continuous scroll sample. Apple servers that advertise precise
@@ -2930,6 +2958,8 @@ public final class VNCSession {
         remoteDisplayResizeTask = nil
         lastRequestedClientDisplaySize = nil
         invalidateInputQueue()
+        unlockStimulus.cancel()
+        lastSentPointer = nil
         transportSession = nil
         invalidateStandardFramebufferPresentation()
         if clearCredentials {
