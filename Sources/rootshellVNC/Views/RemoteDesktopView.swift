@@ -465,7 +465,8 @@ public struct RemoteDesktopView: View {
             // Apple's adaptive profile asks the server for cached cursor
             // images so the responsive local pointer can adopt their shape.
             remoteCursor: session.remoteCursor,
-            remoteCursorPresence: session.remoteCursorPresence)
+            remoteCursorPresence: session.remoteCursorPresence,
+            isViewOnly: session.isViewOnly)
             .frame(width: viewSize.width, height: viewSize.height)
             .contentShape(Rectangle())
         #else

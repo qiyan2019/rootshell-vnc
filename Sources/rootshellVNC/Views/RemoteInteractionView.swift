@@ -37,6 +37,7 @@ struct RemoteInteractionView: UIViewRepresentable {
     let disconnect: () -> Void
     let remoteCursor: RemoteCursor?
     let remoteCursorPresence: RemoteCursorPresence
+    let isViewOnly: Bool
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -92,7 +93,8 @@ struct RemoteInteractionView: UIViewRepresentable {
             toggleFullScreen: toggleFullScreen,
             disconnect: disconnect,
             remoteCursor: remoteCursor,
-            remoteCursorPresence: remoteCursorPresence)
+            remoteCursorPresence: remoteCursorPresence,
+            isViewOnly: isViewOnly)
     }
 
     @MainActor
@@ -156,6 +158,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     /// question it answers can only be checked on a device.
     private static let trackpadCursorLog = VNCLogger(category: "TrackpadCursor")
     private var softwareKeyboardRequested = false
+    private var isViewOnly = false
     private var acceptsHardwareInput = true
     private var lastSeenInputViewsGeneration: UInt64 = 0
     private var lastPointerPoint: (x: UInt16, y: UInt16)?
@@ -852,7 +855,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         toggleFullScreen: (() -> Void)?,
         disconnect: @escaping () -> Void,
         remoteCursor: RemoteCursor?,
-        remoteCursorPresence: RemoteCursorPresence
+        remoteCursorPresence: RemoteCursorPresence,
+        isViewOnly: Bool
     ) {
         if hardwareKeyboard.controlOptionAsCommand != controlOptionAsCommand {
             releaseAllPressedKeys()
@@ -886,6 +890,13 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             framebufferSize: framebufferSize)
 
         self.remoteCursorPresence = remoteCursorPresence
+        if isViewOnly, !self.isViewOnly {
+            // 会话已经先把按下的键和鼠标键抬起来了。这里只停本地手势，不再补发。
+            pointerDragActive = false
+            touchHoldDragActive = false
+            activeScrollRecognizer = nil
+        }
+        self.isViewOnly = isViewOnly
         if self.remoteCursor?.image !== remoteCursor?.image {
             self.remoteCursor = remoteCursor
             remoteCursorShapeRevision &+= 1
@@ -1968,6 +1979,59 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         #endif
     }
 
+    /// 只看时单指滑动平移视口。长按不按下鼠标键。
+    private func handleViewOnlyFinger(
+        mode: DirectTouchGestureRecognizer.Mode,
+        recognizer: DirectTouchGestureRecognizer
+    ) {
+        guard RemoteViewOnlyGestures.effect(
+            of: .singleFingerMove, viewOnly: true) == .panViewport else { return }
+        guard mode == .scroll else { return }
+        switch recognizer.state {
+        case .began:
+            previousScrollTranslation = recognizer.translation
+        case .changed:
+            let delta = CGSize(
+                width: recognizer.translation.x - previousScrollTranslation.x,
+                height: recognizer.translation.y - previousScrollTranslation.y)
+            previousScrollTranslation = recognizer.translation
+            panViewport(by: delta)
+        case .ended, .cancelled, .failed:
+            previousScrollTranslation = .zero
+        default:
+            break
+        }
+    }
+
+    /// 只看时触控板双指滑动也平移，不发滚轮。
+    private func panViewOnly(_ recognizer: UIPanGestureRecognizer) {
+        let translation = recognizer.translation(in: self)
+        switch recognizer.state {
+        case .began:
+            previousScrollTranslation = translation
+        case .changed:
+            let delta = CGSize(
+                width: translation.x - previousScrollTranslation.x,
+                height: translation.y - previousScrollTranslation.y)
+            previousScrollTranslation = translation
+            panViewport(by: delta)
+        case .ended, .cancelled, .failed:
+            previousScrollTranslation = .zero
+            recognizer.setTranslation(.zero, in: self)
+        default:
+            break
+        }
+    }
+
+    private func panViewport(by delta: CGSize) {
+        guard delta != .zero else { return }
+        viewport.pan(
+            by: delta,
+            viewSize: bounds.size,
+            framebufferSize: framebufferSize)
+        onViewportChange?(viewport)
+    }
+
     private func releasePointerDrag() {
         if pointerDragActive, let point = lastPointerPoint {
             touchHandler.handleDragEnd(x: point.x, y: point.y)
@@ -1981,6 +2045,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     /// the momentum tail ourselves from displacement over the gesture's
     /// trailing window, the same way native scroll views derive a fling.
     @objc private func handleNativeScrollState(_ recognizer: UIPanGestureRecognizer) {
+        // 鼠标滚轮不是单指平移。只看时在会话层丢掉，这里也不再记滚动状态。
+        if isViewOnly { return }
         stopEdgeScrolling()
         logInputRoute(
             "scroll state=\(recognizer.state.rawValue) "
@@ -2486,6 +2552,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     @objc private func handlePointerDrag(_ recognizer: UILongPressGestureRecognizer) {
+        if RemoteViewOnlyGestures.effect(of: .longPress, viewOnly: isViewOnly) == .drop {
+            return
+        }
         focusForHardwareKeyboardIfNeeded(recognizer)
         switch recognizer.state {
         case .began, .changed:
@@ -2530,6 +2599,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     @objc private func handleTap(_ recognizer: UITapGestureRecognizer) {
+        if RemoteViewOnlyGestures.effect(of: .tap, viewOnly: isViewOnly) == .drop {
+            return
+        }
         guard recognizer.state == .ended,
               let point = framebufferPoint(
                 for: recognizer.location(in: self)) else { return }
@@ -2552,6 +2624,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     @objc private func handleDoubleTap(_ recognizer: UITapGestureRecognizer) {
+        if RemoteViewOnlyGestures.effect(of: .tap, viewOnly: isViewOnly) == .drop {
+            return
+        }
         guard recognizer.state == .ended,
               let point = framebufferPoint(
                 for: recognizer.location(in: self)) else { return }
@@ -2571,6 +2646,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     @objc private func handleRightTap(_ recognizer: UITapGestureRecognizer) {
+        if RemoteViewOnlyGestures.effect(of: .tap, viewOnly: isViewOnly) == .drop {
+            return
+        }
         guard recognizer.state == .ended else { return }
         let usesTrackpad = pointerMode == .trackpad
         let location = usesTrackpad
@@ -2592,10 +2670,14 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         touchHandler.handleRightClick(x: point.x, y: point.y)
     }
 
-    @objc private func handleDirectTouchState(
+    @objc     private func handleDirectTouchState(
         _ recognizer: DirectTouchGestureRecognizer
     ) {
         guard let mode = recognizer.mode else { return }
+        if isViewOnly {
+            handleViewOnlyFinger(mode: mode, recognizer: recognizer)
+            return
+        }
         if pointerMode == .trackpad {
             handleTrackpadTouchState(mode: mode, recognizer: recognizer)
             return
@@ -2721,6 +2803,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     }
 
     @objc private func handleTrackpadTap(_ recognizer: UITapGestureRecognizer) {
+        if RemoteViewOnlyGestures.effect(of: .tap, viewOnly: isViewOnly) == .drop {
+            return
+        }
         guard recognizer.state == .ended,
               let point = trackpadWirePoint() else { return }
         if momentumCatchPending {
@@ -2742,6 +2827,10 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     /// differs: the samples are addressed to the virtual cursor rather than to
     /// the fingers doing the scrolling.
     @objc private func handleTrackpadScroll(_ recognizer: UIPanGestureRecognizer) {
+        if RemoteViewOnlyGestures.effect(of: .twoFingerMove, viewOnly: isViewOnly) == .panViewport {
+            panViewOnly(recognizer)
+            return
+        }
         stopEdgeScrolling()
         switch recognizer.state {
         case .began:

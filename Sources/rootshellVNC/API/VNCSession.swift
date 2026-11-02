@@ -1521,6 +1521,7 @@ public final class VNCSession {
     /// the behavior of remote-desktop clients' “Type User Password” action.
     /// Callers should obtain confirmation before invoking this method.
     public func sendLoginPassword() {
+        guard !isViewOnly else { return }
         guard canSendLoginPassword, let password = activeCredentials?.password else { return }
 
         guard shouldDeferLoginPasswordForMatchClientStability else {
@@ -1627,13 +1628,49 @@ public final class VNCSession {
         return events
     }
 
+    /// 只看。默认关，和上游一样把输入发给远端。
+    ///
+    /// 从关到开时先抬起已经按下的键和鼠标键，再关闸。剪贴板文本同样丢弃，
+    /// 和 Android `clientClipboard` 一样；共享剪贴板开关和拉取远端剪贴板不在这道闸里。
+    public var isViewOnly: Bool {
+        get { viewOnly }
+        set { updateViewOnly(newValue) }
+    }
+
+    private var viewOnly = false
+    private var heldInput = ViewOnlyHeldInput()
+
+    private func updateViewOnly(_ enabled: Bool) {
+        guard enabled != viewOnly else { return }
+        if enabled {
+            releaseHeldInputBeforeViewOnly()
+        }
+        viewOnly = enabled
+    }
+
+    /// 闸还开着的时候把释放事件送出去。
+    private func releaseHeldInputBeforeViewOnly() {
+        for event in heldInput.releaseEvents() {
+            switch event {
+            case .key(let downFlag, let keysym):
+                sendKeyEvent(downFlag: downFlag, key: keysym)
+            case .pointer(let buttonMask, let x, let y):
+                sendPointerEvent(buttonMask: buttonMask, x: x, y: y)
+            default:
+                break
+            }
+        }
+    }
+
     /// Send a key press or release event to the VNC server.
     ///
     /// - Parameters:
     ///   - downFlag: `true` for key press, `false` for key release.
     ///   - key: The X11 keysym value for the key.
     public func sendKeyEvent(downFlag: Bool, key: UInt32) {
+        guard !isViewOnly else { return }
         guard connectionState.isConnected, transportSession != nil else { return }
+        heldInput.noteKey(down: downFlag, keysym: key)
 
         if isTraceEnabled {
             diagnostics.protocolTrace.recordSent(
@@ -1654,7 +1691,9 @@ public final class VNCSession {
     ///   - x: The X coordinate in framebuffer pixels.
     ///   - y: The Y coordinate in framebuffer pixels.
     public func sendPointerEvent(buttonMask: UInt8, x: UInt16, y: UInt16) {
+        guard !isViewOnly else { return }
         guard connectionState.isConnected, transportSession != nil else { return }
+        heldInput.notePointer(buttonMask: buttonMask, x: x, y: y)
 
         if isTraceEnabled {
             diagnostics.protocolTrace.recordSent(
@@ -1671,6 +1710,7 @@ public final class VNCSession {
     /// scrolling receive the full event; all other servers receive ordinary
     /// RFB wheel-button press/release events from the transport fallback.
     public func sendScrollEvent(_ event: AppleScrollEvent) {
+        guard !isViewOnly else { return }
         guard connectionState.isConnected, transportSession != nil else { return }
 
         if isTraceEnabled {
@@ -1687,6 +1727,7 @@ public final class VNCSession {
     /// Send the begin/end envelope around a precise Apple scroll gesture.
     /// The transport ignores it for conventional RFB servers.
     public func sendGestureEvent(_ event: AppleGestureEvent) {
+        guard !isViewOnly else { return }
         guard connectionState.isConnected, transportSession != nil else { return }
 
         if isTraceEnabled {
@@ -1704,6 +1745,8 @@ public final class VNCSession {
     ///
     /// - Parameter text: The text to place on the server's clipboard.
     public func sendClipboardText(_ text: String) {
+        // Android 的 clientClipboard 在 viewOnly 时直接 return。
+        guard !isViewOnly else { return }
         guard connectionState.isConnected, transportSession != nil else { return }
 
         if isTraceEnabled {
@@ -1723,6 +1766,7 @@ public final class VNCSession {
     /// 原样回发。不支持时退回逐字发键（与 `insertText` 相同，不含粘滞修饰）。
     /// 不把文字或剪贴板内容写入日志。
     public func pasteText(_ text: String) {
+        guard !isViewOnly else { return }
         guard connectionState.isConnected, transportSession != nil else { return }
         guard !text.isEmpty else { return }
         if VNCTextPaste.usesPackedScrap(serverCapabilities) {
@@ -3843,6 +3887,16 @@ public final class VNCSession {
         }
     }
 
+    /// 只看时丢掉的是用户输入。帘幕、共享剪贴板开关和拉取远端剪贴板仍可走。
+    private static func isBlockedWhileViewOnly(_ event: SessionInputEvent) -> Bool {
+        switch event {
+        case .key, .pointer, .scroll, .gesture, .clipboard, .pasteText:
+            return true
+        case .pause, .clipboardRequest, .sharedClipboard, .curtain:
+            return false
+        }
+    }
+
     private static func isRetryableConnectionError(_ error: VNCProtocolError) -> Bool {
         switch error {
         case .connectionClosed, .timeout, .ioError, .protocolViolation,
@@ -3857,6 +3911,7 @@ public final class VNCSession {
     /// and queued continuous-scroll samples are coalesced while button/key and
     /// gesture lifecycle transitions remain exact.
     private func enqueueInput(_ event: SessionInputEvent) {
+        if viewOnly, Self.isBlockedWhileViewOnly(event) { return }
         guard connectionState.isConnected,
               let transport = transportSession else { return }
 
