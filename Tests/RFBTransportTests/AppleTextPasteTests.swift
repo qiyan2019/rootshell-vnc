@@ -77,6 +77,54 @@ final class AppleTextPasteTests: XCTestCase {
         XCTAssertFalse(replacing.elementsEqual(restoring))
     }
 
+    func testDevicePasteSendsQueuedTextFirstAndDropsTheSnapshot() throws {
+        var state = AppleTextPasteState()
+        XCTAssertEqual(try state.submit("hi"), [.requestSnapshot])
+        XCTAssertEqual(try state.submit("yo"), [])
+
+        let steps = try state.pasteReplacing("clip")
+        guard case .send(let data) = steps.first else {
+            return XCTFail("排队文字应和粘贴键并成一次发送")
+        }
+        let packed = try AppleClipboardProtocol.packedTextMessage("hiyoclip")
+        XCTAssertEqual(steps, [.send(packed + AppleTextPaste.commandVKeys())])
+        XCTAssertEqual(data, packed + AppleTextPaste.commandVKeys())
+
+        let late = Data([0xAB, 0xCD, 0xEF, 0x01])
+        XCTAssertEqual(state.receive(late), [])
+        XCTAssertNil(state.savedScrap)
+        XCTAssertEqual(try state.submit("z"), [.requestSnapshot])
+    }
+
+    func testDevicePasteDropsCachedScrap() throws {
+        var state = AppleTextPasteState()
+        XCTAssertEqual(try state.submit("hi"), [.requestSnapshot])
+        let original = Data([0x11, 0x22, 0x33, 0x44])
+        _ = state.receive(original)
+        XCTAssertEqual(state.savedScrap, original)
+
+        let steps = try state.pasteReplacing("clip")
+        let packed = try AppleClipboardProtocol.packedTextMessage("clip")
+        XCTAssertEqual(steps, [.send(packed + AppleTextPaste.commandVKeys())])
+        XCTAssertNil(state.savedScrap)
+        XCTAssertEqual(try state.submit("z"), [.requestSnapshot])
+    }
+
+    func testDevicePasteWhileARequestIsOutstandingDropsThePreviousScrap() throws {
+        var state = AppleTextPasteState()
+        XCTAssertEqual(try state.submit("hi"), [.requestSnapshot])
+        let original = Data([0x11, 0x22])
+        _ = state.receive(original)
+        XCTAssertEqual(try state.submit("yo", useCachedScrap: false), [.requestSnapshot])
+
+        let steps = try state.pasteReplacing("clip")
+        let packed = try AppleClipboardProtocol.packedTextMessage("yoclip")
+        XCTAssertEqual(steps, [.send(packed + AppleTextPaste.commandVKeys())])
+        XCTAssertEqual(state.receive(Data([0x55, 0x66])), [])
+        XCTAssertNil(state.savedScrap)
+        XCTAssertEqual(try state.submit("z"), [.requestSnapshot])
+    }
+
     func testSyncOffRequestsAgainEvenWhenScrapIsSaved() throws {
         var state = AppleTextPasteState()
         XCTAssertEqual(try state.submit("hi", useCachedScrap: false), [.requestSnapshot])

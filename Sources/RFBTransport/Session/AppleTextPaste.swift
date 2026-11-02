@@ -43,6 +43,8 @@ struct AppleTextPasteState: Sendable {
 
     private(set) var savedScrap: Data?
     private var requestPending = false
+    /// 粘贴键已经把在等的文字发出去了。随后到达的 type-11 是这次请求的旧快照，不能再存。
+    private var ignoreOutstandingScrap = false
     private var queue: [String] = []
 
     /// `useCachedScrap` 对应「剪贴板同步」开着：才能直接用上一条 type-31。
@@ -79,8 +81,28 @@ struct AppleTextPasteState: Sendable {
         return steps
     }
 
+    /// 粘贴键。队列里还在等应答的文字排在前面，合成一次发出，不回发。
+    /// 同时丢掉已有快照：否则下一次上屏会用旧 scrap 把刚贴的内容盖掉。
+    /// 还在等的 type-11 应答之后不再发送，也不记成新快照。
+    mutating func pasteReplacing(_ text: String) throws -> [Step] {
+        guard !text.isEmpty else { return [] }
+        let merged = queue.joined() + text
+        queue.removeAll()
+        if requestPending {
+            ignoreOutstandingScrap = true
+        }
+        requestPending = false
+        savedScrap = nil
+        return [.send(try AppleTextPaste.payload(text: merged, savedScrap: nil))]
+    }
+
     /// 记下服务端 scrap 的原始字节。队列里的定稿文字用这段字节回发。
     mutating func receive(_ scrap: Data) -> [Step] {
+        if ignoreOutstandingScrap {
+            ignoreOutstandingScrap = false
+            requestPending = false
+            return []
+        }
         savedScrap = scrap
         requestPending = false
         guard !queue.isEmpty else { return [] }

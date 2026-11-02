@@ -1155,15 +1155,15 @@ public actor TransportSession {
         return true
     }
 
-    /// 粘贴键：packed scrap 和 Cmd+V 放在同一次写出里，不回发原来的 scrap，也不发 type-11。
+    /// 粘贴键：排队中的定稿文字排在前面，和这次文字一次写出，不回发原来的 scrap。
     /// 没有能力位 31 时返回 false，调用方逐字发键。不记录剪贴板内容。
     public func pasteReplacingClipboard(_ text: String) async throws -> Bool {
         guard Self.shouldUseApplePackedClipboard(
             capabilities: appleServerCapabilities) else {
             return false
         }
-        let payload = try AppleTextPaste.payload(text: text, savedScrap: nil)
-        try await sendClientPayload(payload, traceBytes: false)
+        let steps = try textPaste.pasteReplacing(text)
+        try await performTextPaste(steps)
         return true
     }
 
