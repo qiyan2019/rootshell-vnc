@@ -837,6 +837,17 @@ public final class VNCSession {
     /// ordered as announced by the server (primary first). Standard mode uses
     /// these to present only the number of displays selected by the user.
     private(set) var remoteDisplayRegions: [CGRect] = []
+
+    /// 已发现的显示器，顺序与服务端通告一致。零尺寸记录不出现。
+    public var remoteDisplays: [VNCRemoteDisplay] {
+        remoteDisplayRegionOrder.compactMap { id in
+            guard let region = remoteDisplayRegionByID[id] else { return nil }
+            return VNCRemoteDisplay(
+                id: id,
+                origin: region.origin,
+                size: region.size)
+        }
+    }
     @ObservationIgnored
     private var remoteDisplayRegionByID: [UInt32: CGRect] = [:]
     @ObservationIgnored
@@ -1720,6 +1731,23 @@ public final class VNCSession {
               transportSession != nil,
               supportsRemoteSharedClipboardControl else { return }
         enqueueInput(.sharedClipboard(enabled))
+    }
+
+    /// 标准模式下改选一块物理显示器，或把全部拼在一起。
+    ///
+    /// `nil` 发送和首次拼合相同的 global SetDisplay。非 `nil` 发送该 id 的
+    /// 非 global SetDisplay，初次发送之后也可以再发。不重连。不是 Apple、
+    /// 还没有显示器列表、id 不在列表里，或当前是高性能模式时不发任何字节，
+    /// 返回 false。高性能路径的状态机不会被碰到。
+    @discardableResult
+    public func selectRemoteDisplay(id: UInt32?) async -> Bool {
+        guard !isHighPerformanceMode,
+              connectionState.isConnected,
+              let transport = transportSession else { return false }
+        let known = remoteDisplays
+        guard !known.isEmpty else { return false }
+        if let id, !known.contains(where: { $0.id == id }) { return false }
+        return await transport.selectStandardRemoteDisplay(id: id)
     }
 
     /// Curtain or uncurtain the remote Mac's own display.

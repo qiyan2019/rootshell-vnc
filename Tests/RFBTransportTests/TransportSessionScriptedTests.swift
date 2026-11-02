@@ -1851,6 +1851,145 @@ final class TransportSessionScriptedTests: XCTestCase {
         await session.disconnect()
     }
 
+    func testStandardDisplaySelectionCanBeRepeatedAfterTheInitialSetDisplay() async throws {
+        let firstID: UInt32 = 1
+        let secondID: UInt32 = 3
+        let displays = [
+            AppleDisplayInfo(
+                displayIndex: firstID,
+                originX: 4, originY: 0,
+                width: 2, height: 1,
+                flags: 0),
+            AppleDisplayInfo(
+                displayIndex: secondID,
+                originX: 0, originY: 0,
+                width: 4, height: 2,
+                flags: 0),
+        ]
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: 6, height: 2, name: "apple-reselect"))
+        script.append(Self.framebufferUpdate([(
+            Self.rectangleHeader(
+                x: 0, y: 0, width: 0, height: 0,
+                encoding: 1105),
+            appleDisplayInfo2TestPayload(displays: displays)
+        )]))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "apple-reselect.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: Self.appleDCTEncodings,
+            displayCount: 1,
+            connection: connection)
+        let updateTask = Task { () -> Bool in
+            for await event in session.events {
+                if case .framebufferUpdate = event { return true }
+            }
+            return false
+        }
+        try await session.connect()
+        let receivedUpdate = await Self.withTimeout(seconds: 2) {
+            await updateTask.value
+        }
+        XCTAssertEqual(receivedUpdate, true)
+
+        let first = Self.setDisplayMessage(id: firstID)
+        let initialCount = Self.occurrenceCount(
+            of: first, in: await connection.sentBytes())
+        XCTAssertEqual(initialCount, 1)
+
+        let beforeRefusal = await connection.sentBytes()
+        let refused = await session.selectStandardRemoteDisplay(id: 99)
+        let afterRefusal = await connection.sentBytes()
+        XCTAssertFalse(refused)
+        XCTAssertEqual(afterRefusal, beforeRefusal)
+
+        let selected = await session.selectStandardRemoteDisplay(id: secondID)
+        XCTAssertTrue(selected)
+        let second = Self.setDisplayMessage(id: secondID)
+        let sent = await connection.sentBytes()
+        XCTAssertEqual(Self.occurrenceCount(of: first, in: sent), 1)
+        XCTAssertEqual(Self.occurrenceCount(of: second, in: sent), 1)
+
+        let combined = await session.selectStandardRemoteDisplay(id: nil)
+        XCTAssertTrue(combined)
+        let global = Data([
+            0x0d, 0x01, 0x00, 0x00,
+            0xff, 0xff, 0xff, 0xff,
+        ])
+        let after = await connection.sentBytes()
+        XCTAssertEqual(Self.occurrenceCount(of: global, in: after), 1)
+        XCTAssertEqual(Self.occurrenceCount(of: second, in: after), 1)
+        await session.disconnect()
+    }
+
+    func testSelectRemoteDisplaySendsNothingWithoutADisplayList() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: 2, height: 1, name: "apple-no-layout"))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "apple-no-layout.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: Self.appleDCTEncodings,
+            displayCount: 1,
+            connection: connection)
+        try await session.connect()
+
+        let before = await connection.sentBytes()
+        let combined = await session.selectStandardRemoteDisplay(id: nil)
+        let specific = await session.selectStandardRemoteDisplay(id: 1)
+        let after = await connection.sentBytes()
+        XCTAssertFalse(combined)
+        XCTAssertFalse(specific)
+        XCTAssertEqual(after, before)
+        await session.disconnect()
+    }
+
+    func testSelectRemoteDisplayRefusesConventionalServer() async throws {
+        let connection = ScriptedRFBConnection()
+        var script = Data("RFB 003.008\n".utf8)
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: 2, height: 1, name: "plain"))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "plain.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: [.raw],
+            connection: connection)
+        try await session.connect()
+
+        let before = await connection.sentBytes()
+        let combined = await session.selectStandardRemoteDisplay(id: nil)
+        let specific = await session.selectStandardRemoteDisplay(id: 1)
+        let after = await connection.sentBytes()
+        XCTAssertFalse(combined)
+        XCTAssertFalse(specific)
+        XCTAssertEqual(after, before)
+        await session.disconnect()
+    }
+
+    private static func setDisplayMessage(id: UInt32) -> Data {
+        var data = Data([0x0d, 0x00, 0x00, 0x00])
+        data.append(uint32Bytes(id))
+        return data
+    }
+
     // MARK: - Wire-format helpers
 
     private static func serverInitMessage(

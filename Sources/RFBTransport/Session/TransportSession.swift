@@ -392,6 +392,8 @@ public actor TransportSession {
     /// Physical or virtual screen geometry announced by Apple's encrypted
     /// DisplayInfo2 control record, in the server's display order.
     private var appleMediaDisplayInfos: [AppleDisplayInfo] = []
+    /// 标准模式 DisplayInfo2 通告过的 id。只给再次选择显示器用，别的路径不读。
+    private var standardAnnouncedDisplayIDs: [UInt32] = []
     /// Classic Apple display records arrive one rectangle at a time. Retain
     /// them while a zero-sized ServerInit is waiting for a usable union so the
     /// state machine and request loop advance with the same geometry as the
@@ -2447,6 +2449,7 @@ public actor TransportSession {
                         source: "standard RFB 1105")
                     let displayInfos = appleDisplayInfo2Records(payload)
                     completeAppleDisplayLayout = displayInfos
+                    standardAnnouncedDisplayIDs = displayInfos.map(\.displayIndex)
                     emitAppleDisplayInfoCompatibilityEvents(displayInfos)
                     if let firstDisplay = displayInfos.first {
                         try await sendAppleStandardDisplaySelectionIfNeeded(
@@ -3290,6 +3293,28 @@ public actor TransportSession {
         try await sendAppleMediaControlPayload(appleSetDisplayMessage(
             isGlobal: combinesAllDisplays,
             displayID: displayID))
+    }
+
+    /// 标准模式再次发送 SetDisplay。字节和首次发送用的是同一个构造。
+    /// 高性能模式、非 Apple、或还没有显示器列表时拒绝，不改那些路径的状态。
+    package func selectStandardRemoteDisplay(id: UInt32?) async -> Bool {
+        guard !requestAppleMediaStream,
+              stateMachine.negotiatedVersion?.isApple == true,
+              !standardAnnouncedDisplayIDs.isEmpty else { return false }
+        if let id, !standardAnnouncedDisplayIDs.contains(id) {
+            return false
+        }
+        do {
+            try await sendClientPayload(appleSetDisplayMessage(
+                isGlobal: id == nil,
+                displayID: id ?? 0))
+            return true
+        } catch {
+            log.warning(
+                "Failed to reselect remote display: "
+                    + error.localizedDescription)
+            return false
+        }
     }
 
     private func sendAppleStandardDisplaySelectionIfNeeded(
