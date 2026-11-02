@@ -80,6 +80,8 @@ public struct RemoteDesktopView: View {
     private let externalPointerMode: Binding<RemotePointerMode>?
     /// 相对适配比例放大时为 true，回到适配时为 false。只在翻转时调用。
     private let onViewportZoomChange: (@MainActor (Bool) -> Void)?
+    /// 非 nil 时，手动的登录密码请求交给宿主，自动 pending 不再被视图消费。
+    private let onLoginPasswordRequest: (@MainActor () -> Void)?
     private let pointerSpeed: Double
     /// On-screen height of the locally drawn pointer, in view points. The
     /// host owns this because only it knows the display the desktop is being
@@ -111,7 +113,8 @@ public struct RemoteDesktopView: View {
         brightnessGain: Double = 1.0,
         showsBuiltInControls: Bool = true,
         pointerMode: Binding<RemotePointerMode>? = nil,
-        onViewportZoomChange: (@MainActor (Bool) -> Void)? = nil
+        onViewportZoomChange: (@MainActor (Bool) -> Void)? = nil,
+        onLoginPasswordRequest: (@MainActor () -> Void)? = nil
     ) {
         self.init(
             session: session,
@@ -130,6 +133,7 @@ public struct RemoteDesktopView: View {
             showsBuiltInControls: showsBuiltInControls,
             pointerMode: pointerMode,
             onViewportZoomChange: onViewportZoomChange,
+            onLoginPasswordRequest: onLoginPasswordRequest,
             hudMenuExtras: nil)
     }
 
@@ -156,6 +160,7 @@ public struct RemoteDesktopView: View {
         showsBuiltInControls: Bool = true,
         pointerMode: Binding<RemotePointerMode>? = nil,
         onViewportZoomChange: (@MainActor (Bool) -> Void)? = nil,
+        onLoginPasswordRequest: (@MainActor () -> Void)? = nil,
         @ViewBuilder hudMenuExtras: () -> MenuExtras
     ) {
         self.init(
@@ -175,6 +180,7 @@ public struct RemoteDesktopView: View {
             showsBuiltInControls: showsBuiltInControls,
             pointerMode: pointerMode,
             onViewportZoomChange: onViewportZoomChange,
+            onLoginPasswordRequest: onLoginPasswordRequest,
             hudMenuExtras: AnyView(hudMenuExtras()))
     }
 
@@ -195,6 +201,7 @@ public struct RemoteDesktopView: View {
         showsBuiltInControls: Bool,
         pointerMode: Binding<RemotePointerMode>?,
         onViewportZoomChange: (@MainActor (Bool) -> Void)?,
+        onLoginPasswordRequest: (@MainActor () -> Void)?,
         hudMenuExtras: AnyView?
     ) {
         self.session = session
@@ -203,6 +210,7 @@ public struct RemoteDesktopView: View {
         self.showsBuiltInControls = showsBuiltInControls
         self.externalPointerMode = pointerMode
         self.onViewportZoomChange = onViewportZoomChange
+        self.onLoginPasswordRequest = onLoginPasswordRequest
         self._viewportPanningMode = State(initialValue: initialViewportPanningMode)
         self._pointerMode = State(initialValue: initialPointerMode)
         self.pointerSpeed = pointerSpeed
@@ -744,14 +752,35 @@ public struct RemoteDesktopView: View {
     }
 
     private func requestPasswordSend() {
-        guard session.canSendLoginPassword else { return }
-        confirmPasswordSend = true
+        switch LoginPasswordPromptRoute.manual(
+            hostHandlesRequest: onLoginPasswordRequest != nil,
+            canSend: session.canSendLoginPassword
+        ) {
+        case .presentBuiltIn:
+            confirmPasswordSend = true
+        case .notifyHost:
+            onLoginPasswordRequest?()
+        case .ignore:
+            break
+        }
     }
 
     private func presentPendingLoginPasswordPrompt() {
-        guard session.loginPasswordPromptPending else { return }
-        guard session.consumeLoginPasswordPromptRequest() else { return }
-        confirmPasswordSend = true
+        switch LoginPasswordPromptRoute.automatic(
+            hostHandlesRequest: onLoginPasswordRequest != nil,
+            pending: session.loginPasswordPromptPending,
+            canSend: session.canSendLoginPassword
+        ) {
+        case .presentBuiltIn(consumingPending: true):
+            guard session.consumeLoginPasswordPromptRequest() else { return }
+            confirmPasswordSend = true
+        case .presentBuiltIn(consumingPending: false):
+            confirmPasswordSend = true
+        case .notifyHost:
+            onLoginPasswordRequest?()
+        case .ignore:
+            break
+        }
     }
 
     private func requestDictation() {
