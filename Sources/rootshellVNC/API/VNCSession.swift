@@ -2723,11 +2723,10 @@ public final class VNCSession {
         // full-framebuffer snapshot + image publish is capped at
         // targetFrameRate. A trailing snapshot guarantees the final state
         // always renders after a burst.
-        let frameInterval = UInt64(
-            1_000_000_000 / max(1, configuration.targetFrameRate))
-        // 挂了呈现器时屏幕不靠这张图，图只低频发布。
+        let frameInterval = framebufferFrameIntervalNanos
+        // 挂了呈现器时屏幕不靠这张图，图只低频发布；有人要实时读它时除外。
         let presenter = framebufferPresenter
-        let publishInterval = presenter == nil
+        let publishInterval = presenter == nil || publishesLiveFramebufferImage
             ? frameInterval
             : max(frameInterval, Self.presentedImagePublishIntervalNanos)
         let renderStarted = DispatchTime.now().uptimeNanoseconds
@@ -4335,7 +4334,7 @@ public final class VNCSession {
 
     // MARK: - GPU 呈现
 
-    /// 视图挂上呈现器。之后逐帧画面走纹理，`currentImage` 转为低频。
+    /// 视图挂上呈现器。之后逐帧画面走纹理，`currentImage` 转为低频（见 `publishesLiveFramebufferImage`）。
     func attachFramebufferPresenter(_ presenter: FramebufferMetalPresenter) {
         framebufferPresenter = presenter
         presenter.setPresentationAllowed(
@@ -4351,6 +4350,24 @@ public final class VNCSession {
         framebufferPresenter = nil
         trailingFramePresentTask?.cancel()
         trailingFramePresentTask = nil
+    }
+
+    /// 有调用方靠 `currentImage` 判断画面变化时打开（登录密码投递）。
+    /// 打开期间这张图不走呈现器的低频节奏，和没挂呈现器时一样按帧率发布。
+    public var publishesLiveFramebufferImage = false {
+        didSet {
+            guard publishesLiveFramebufferImage, !oldValue, framebufferPresenter != nil else {
+                return
+            }
+            // 低频周期里到的画面已经写进帧缓冲，尾帧任务却排在最多 500ms 之后，换成按帧率的。
+            trailingSnapshotTask?.cancel()
+            trailingSnapshotTask = nil
+            scheduleTrailingSnapshot(interval: framebufferFrameIntervalNanos)
+        }
+    }
+
+    private var framebufferFrameIntervalNanos: UInt64 {
+        UInt64(1_000_000_000 / max(1, configuration.targetFrameRate))
     }
 
     /// 实际提交给 GPU 的帧数（性能基准用）。

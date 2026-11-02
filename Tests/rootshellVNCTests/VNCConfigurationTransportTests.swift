@@ -1174,6 +1174,88 @@ final class VNCConfigurationTransportTests: XCTestCase {
         XCTAssertFalse(session.hasPublishedFramebufferImage)
     }
 
+    /// 登录投递靠 `currentImage` 判断画面变化，打开实时发布后不能再晚 500ms。
+    @MainActor
+    func testLiveImagePublishingKeepsCurrentImageFreshWithPresenter() async throws {
+        guard let presenter = FramebufferMetalPresenter() else {
+            throw XCTSkip("没有可用的 Metal 设备")
+        }
+        let connection = SuccessfulRFBConnection(
+            name: "metal-live-image",
+            width: 8,
+            height: 8,
+            recordsFramebufferUpdateRequests: true)
+        var configuration = VNCConfiguration(
+            videoQualityMode: .standard,
+            reconnectionPolicy: VNCReconnectionPolicy(isEnabled: false, maximumAttempts: 0))
+        configuration.targetFrameRate = 120
+        configuration.transportProvider = { _, _ in connection }
+        let session = VNCSession(configuration: configuration)
+        try await session.connect(credentials: VNCCredentials(
+            host: "metal.test", port: 5900, password: ""))
+        var completed = await waitUntil { session.connectionState.isConnected }
+        XCTAssertTrue(completed)
+
+        await connection.enqueueServerBytes(Self.rawFramebufferUpdate(
+            x: 0, y: 0, width: 8, height: 8, byte: 0x10))
+        completed = await waitUntil { session.currentImage != nil }
+        XCTAssertTrue(completed)
+        session.attachFramebufferPresenter(presenter)
+
+        // 低频周期内到的一批：尾帧任务排在 500ms 之后，图片暂时是旧的。
+        let requests = await connection.framebufferUpdateRequestCount()
+        await connection.enqueueServerBytes(Self.rawFramebufferUpdate(
+            x: 0, y: 0, width: 8, height: 8, byte: 0x20))
+        completed = await waitForFramebufferRequest(after: requests, on: connection)
+        XCTAssertTrue(completed)
+
+        // 打开后不能等那个尾帧：已经写进帧缓冲的画面要马上落到图片上。
+        session.publishesLiveFramebufferImage = true
+        var clock = ContinuousClock.now
+        completed = await waitUntil { Self.firstByte(of: session.currentImage) == 0x20 }
+        XCTAssertTrue(completed, "打开实时发布时没有补上积压的画面")
+        if clock.duration(to: .now) >= .milliseconds(300) {
+            XCTFail("积压的画面要立即发布，实际耗时 \(clock.duration(to: .now))")
+        }
+
+        // 打开期间每批画面都按帧率发布。
+        for byte in UInt8(0x30)...UInt8(0x33) {
+            try await Task.sleep(for: .milliseconds(20))
+            clock = ContinuousClock.now
+            await connection.enqueueServerBytes(Self.rawFramebufferUpdate(
+                x: 0, y: 0, width: 8, height: 8, byte: byte))
+            completed = await waitUntil { Self.firstByte(of: session.currentImage) == byte }
+            XCTAssertTrue(completed, "实时发布期间画面没有更新")
+            if clock.duration(to: .now) >= .milliseconds(300) {
+                XCTFail("实时发布期间不该按低频节奏，实际耗时 \(clock.duration(to: .now))")
+            }
+        }
+
+        // 关掉后回到低频，纹理路径的 CPU 优化不能被这个开关永久破坏。
+        session.publishesLiveFramebufferImage = false
+        try await Task.sleep(for: .milliseconds(20))
+        let settledImage = try XCTUnwrap(session.currentImage)
+        let lowRateClock = ContinuousClock.now
+        await connection.enqueueServerBytes(Self.rawFramebufferUpdate(
+            x: 0, y: 0, width: 8, height: 8, byte: 0x40))
+        completed = await waitUntil { presenter.presentRequestCount > 0 }
+        XCTAssertTrue(completed)
+        try await Task.sleep(for: .milliseconds(100))
+        if lowRateClock.duration(to: .now) < .milliseconds(350) {
+            XCTAssertTrue(session.currentImage === settledImage, "关掉后应回到低频")
+        }
+        completed = await waitUntil { Self.firstByte(of: session.currentImage) == 0x40 }
+        XCTAssertTrue(completed, "关掉后尾帧仍要落到图片上")
+
+        session.detachFramebufferPresenter(presenter)
+        session.disconnect()
+    }
+
+    private static func firstByte(of image: CGImage?) -> UInt8? {
+        guard let data = image?.dataProvider?.data as Data? else { return nil }
+        return data.first
+    }
+
     /// 暂停呈现（后台、页面关闭）时不能碰 GPU，恢复后补一帧。
     @MainActor
     func testSuspendingPresentationGatesPresenter() async throws {
