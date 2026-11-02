@@ -74,6 +74,8 @@ public struct RemoteDesktopView: View {
     private let brightnessGain: Double
     /// 为 false 时不画内置 HUD。默认 true，和上游一样画 `viewportControls`。
     private let showsBuiltInControls: Bool
+    /// 非 nil 时由宿主驱动指针模式，菜单写入也走这个绑定。
+    private let externalPointerMode: Binding<RemotePointerMode>?
     private let pointerSpeed: Double
     /// On-screen height of the locally drawn pointer, in view points. The
     /// host owns this because only it knows the display the desktop is being
@@ -103,7 +105,8 @@ public struct RemoteDesktopView: View {
         onSharedClipboardUserChange: (@MainActor (Bool) -> Void)? = nil,
         hostOwnsRecoveryChrome: Bool = false,
         brightnessGain: Double = 1.0,
-        showsBuiltInControls: Bool = true
+        showsBuiltInControls: Bool = true,
+        pointerMode: Binding<RemotePointerMode>? = nil
     ) {
         self.init(
             session: session,
@@ -120,6 +123,7 @@ public struct RemoteDesktopView: View {
             hostOwnsRecoveryChrome: hostOwnsRecoveryChrome,
             brightnessGain: brightnessGain,
             showsBuiltInControls: showsBuiltInControls,
+            pointerMode: pointerMode,
             hudMenuExtras: nil)
     }
 
@@ -144,6 +148,7 @@ public struct RemoteDesktopView: View {
         hostOwnsRecoveryChrome: Bool = false,
         brightnessGain: Double = 1.0,
         showsBuiltInControls: Bool = true,
+        pointerMode: Binding<RemotePointerMode>? = nil,
         @ViewBuilder hudMenuExtras: () -> MenuExtras
     ) {
         self.init(
@@ -161,6 +166,7 @@ public struct RemoteDesktopView: View {
             hostOwnsRecoveryChrome: hostOwnsRecoveryChrome,
             brightnessGain: brightnessGain,
             showsBuiltInControls: showsBuiltInControls,
+            pointerMode: pointerMode,
             hudMenuExtras: AnyView(hudMenuExtras()))
     }
 
@@ -179,12 +185,14 @@ public struct RemoteDesktopView: View {
         hostOwnsRecoveryChrome: Bool,
         brightnessGain: Double,
         showsBuiltInControls: Bool,
+        pointerMode: Binding<RemotePointerMode>?,
         hudMenuExtras: AnyView?
     ) {
         self.session = session
         self.hostOwnsRecoveryChrome = hostOwnsRecoveryChrome
         self.hudMenuExtras = hudMenuExtras
         self.showsBuiltInControls = showsBuiltInControls
+        self.externalPointerMode = pointerMode
         self._viewportPanningMode = State(initialValue: initialViewportPanningMode)
         self._pointerMode = State(initialValue: initialPointerMode)
         self.pointerSpeed = pointerSpeed
@@ -417,7 +425,7 @@ public struct RemoteDesktopView: View {
         RemoteInteractionView(
             viewport: $viewport,
             viewportPanningMode: viewportPanningMode,
-            pointerMode: pointerMode,
+            pointerMode: resolvedPointerMode,
             pointerSpeed: pointerSpeed,
             cursorHeight: cursorHeight,
             serverRendersCursor: session.activeCursorRendering == .server,
@@ -660,15 +668,15 @@ public struct RemoteDesktopView: View {
             Menu {
                 ForEach(RemotePointerMode.allCases, id: \.self) { mode in
                     Button {
-                        pointerMode = mode
+                        selectPointerMode(mode)
                     } label: {
                         Label(
                             pointerModeTitle(mode),
-                            systemImage: pointerMode == mode
+                            systemImage: resolvedPointerMode == mode
                                 ? "checkmark"
                                 : pointerModeImage(mode))
                     }
-                    .disabled(pointerMode == mode)
+                    .disabled(resolvedPointerMode == mode)
                 }
             } label: {
                 Label(
@@ -696,6 +704,20 @@ public struct RemoteDesktopView: View {
             Label(
                 String(localized: "Display", bundle: .module),
                 systemImage: "display")
+        }
+    }
+
+    /// 有外部绑定时读它，否则读内部状态。
+    private var resolvedPointerMode: RemotePointerMode {
+        externalPointerMode?.wrappedValue ?? pointerMode
+    }
+
+    /// 菜单选择写回外部绑定；没给绑定时仍写内部状态。
+    private func selectPointerMode(_ mode: RemotePointerMode) {
+        if let binding = externalPointerMode {
+            binding.wrappedValue = mode
+        } else {
+            pointerMode = mode
         }
     }
 
