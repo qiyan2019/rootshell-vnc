@@ -987,7 +987,11 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     func insertText(_ text: String) {
         let modifiers = keyboardCapture.supplementalModifiers
         var dispatched = false
-        for character in text {
+        // 钩子只拦软键盘定稿文字。退格、回车、方向键、硬件键盘仍走各自的原路径。
+        VNCSoftKeyboardCommit.deliver(
+            text,
+            hook: keyboardCapture.onCommitText
+        ) { character in
             dispatched = keyboardHandler.handleKeyTap(
                 character,
                 supplementalModifiers: modifiers) || dispatched

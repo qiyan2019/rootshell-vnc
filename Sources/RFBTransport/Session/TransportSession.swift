@@ -741,6 +741,8 @@ public actor TransportSession {
     /// wheel-button input.
     private var appleServerCapabilities: AppleServerCapabilities?
     private var appleClipboardRequestID: UInt32 = 0
+    /// 最近一条服务端 type-31 的原始字节，供定稿文字粘贴后原样回发。
+    private var textPaste = AppleTextPasteState()
     private var appleSharedClipboardEnabled = false
     /// A regular RFB server may receive SetDesktopSize only after it sends an
     /// ExtendedDesktopSize rectangle. Retain that screen identity and any
@@ -1136,6 +1138,21 @@ public actor TransportSession {
             payload = ClientMessage.clientCutText(text).serialize()
         }
         try await sendClientPayload(payload)
+    }
+
+    /// 把定稿文字贴到远端：packed scrap、Cmd+V，再原样回发之前的 scrap。
+    ///
+    /// 没有能力位 31 时返回 false，调用方逐字发键。还没有服务端 scrap 时先发一次
+    /// type-11，文字先排队，应答到达后再粘贴并回发原始字节。不记录剪贴板内容。
+    public func pasteCommittedText(_ text: String) async throws -> Bool {
+        guard Self.shouldUseApplePackedClipboard(
+            capabilities: appleServerCapabilities) else {
+            return false
+        }
+        let steps = try textPaste.submit(
+            text, useCachedScrap: appleSharedClipboardEnabled)
+        try await performTextPaste(steps)
+        return true
     }
 
     public var supportsRemoteClipboardRequest: Bool {
@@ -2768,6 +2785,10 @@ public actor TransportSession {
         }
 
         let compressed = try await readControlChannel(exactly: compressedLength)
+        var wire = Data([AppleClipboardProtocol.packedScrapMessageType])
+        wire.append(header)
+        wire.append(compressed)
+        await retainPackedScrap(wire)
         decodeApplePackedClipboard(
             compressed,
             uncompressedLength: uncompressedLength)
@@ -3778,23 +3799,55 @@ public actor TransportSession {
         }
     }
 
-    private func sendClientPayload(_ payload: Data) async throws {
+    private func sendClientPayload(
+        _ payload: Data,
+        traceBytes: Bool = true
+    ) async throws {
         if acceptedAppleMediaStream {
             let label = hasEncryptedAppleMediaControl
                 ? "client encrypted payload"
                 : "client plaintext media payload"
-            traceAppleMediaClientPayload(label: label, payload: payload)
-            try await sendAppleMediaControlPayload(payload)
+            if traceBytes {
+                traceAppleMediaClientPayload(label: label, payload: payload)
+            }
+            try await sendAppleMediaControlPayload(payload, traceBytes: traceBytes)
         } else {
-            if requestAppleMediaStream {
+            if traceBytes, requestAppleMediaStream {
                 traceAppleMediaClientPayload(label: "client plaintext payload", payload: payload)
             }
             try await sendControlChannel(payload)
         }
     }
 
-    private func sendAppleMediaControlPayload(_ payload: Data) async throws {
-        dumpAppleMediaClientRecordIfRequested(payload)
+    /// 定稿文字粘贴的字节不进日志，也不进媒体诊断转储。
+    private func performTextPaste(_ steps: [AppleTextPasteState.Step]) async throws {
+        for step in steps {
+            switch step {
+            case .requestSnapshot:
+                try await requestRemoteClipboard()
+            case .send(let payload):
+                try await sendClientPayload(payload, traceBytes: false)
+            }
+        }
+    }
+
+    private func retainPackedScrap(_ wire: Data) async {
+        let steps = textPaste.receive(wire)
+        do {
+            try await performTextPaste(steps)
+        } catch {
+            log.warning(
+                "Failed to paste committed text: \(error.localizedDescription)")
+        }
+    }
+
+    private func sendAppleMediaControlPayload(
+        _ payload: Data,
+        traceBytes: Bool = true
+    ) async throws {
+        if traceBytes {
+            dumpAppleMediaClientRecordIfRequested(payload)
+        }
         if let channel = appleMediaComCryptionChannel {
             let encrypted = try channel.encryptPayload(payload, packetID: appleMediaClientPacketID)
             appleMediaClientPacketID &+= 1
@@ -3807,7 +3860,9 @@ public actor TransportSession {
             framed.append(UInt8((encrypted.count >> 8) & 0xFF))
             framed.append(UInt8(encrypted.count & 0xFF))
             framed.append(encrypted)
-            traceAppleMediaClientFrame(label: "client ComCryption frame", payload: payload, framed: framed)
+            if traceBytes {
+                traceAppleMediaClientFrame(label: "client ComCryption frame", payload: payload, framed: framed)
+            }
             try await sendControlChannel(framed)
             return
         }
@@ -3823,8 +3878,10 @@ public actor TransportSession {
             // servers therefore retain ordinary RFB framing for the media
             // control messages until/unless an encrypted transition is
             // explicitly negotiated.
-            traceAppleMediaClientPayload(
-                label: "client plaintext media control", payload: payload)
+            if traceBytes {
+                traceAppleMediaClientPayload(
+                    label: "client plaintext media control", payload: payload)
+            }
             try await sendControlChannel(payload)
             return
         }
@@ -3839,7 +3896,9 @@ public actor TransportSession {
         framed.append(UInt8((encrypted.count >> 8) & 0xFF))
         framed.append(UInt8(encrypted.count & 0xFF))
         framed.append(encrypted)
-        traceAppleMediaClientFrame(label: "client AES frame", payload: payload, framed: framed)
+        if traceBytes {
+            traceAppleMediaClientFrame(label: "client AES frame", payload: payload, framed: framed)
+        }
         try await sendControlChannel(framed)
     }
 
@@ -4001,7 +4060,7 @@ public actor TransportSession {
             case 3:
                 guard try drainAppleDecryptedServerCutText() else { return }
             case AppleClipboardProtocol.packedScrapMessageType:
-                guard try drainAppleDecryptedPackedClipboard() else { return }
+                guard try await drainAppleDecryptedPackedClipboard() else { return }
             case 0x14:
                 guard base + 8 <= appleDecryptedRFBBuffer.endIndex else {
                     return
@@ -4251,7 +4310,7 @@ public actor TransportSession {
         return true
     }
 
-    private func drainAppleDecryptedPackedClipboard() throws -> Bool {
+    private func drainAppleDecryptedPackedClipboard() async throws -> Bool {
         let base = appleDecryptedRFBBuffer.startIndex
         let headerSize = AppleClipboardProtocol.packedScrapHeaderSize
         guard base + headerSize <= appleDecryptedRFBBuffer.endIndex else {
@@ -4274,9 +4333,11 @@ public actor TransportSession {
         guard messageEnd <= appleDecryptedRFBBuffer.endIndex else {
             return false
         }
+        let wire = Data(appleDecryptedRFBBuffer[base..<messageEnd])
         let compressed = Data(appleDecryptedRFBBuffer[
             base + headerSize..<messageEnd])
         appleDecryptedRFBBuffer.removeSubrange(base..<messageEnd)
+        await retainPackedScrap(wire)
         decodeApplePackedClipboard(
             compressed,
             uncompressedLength: uncompressedLength)

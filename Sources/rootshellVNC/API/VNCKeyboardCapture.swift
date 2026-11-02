@@ -153,6 +153,14 @@ public final class VNCKeyboardCapture {
     /// state; locked state can remain in ``supplementalModifiers``.
     public var onSupplementalModifiersConsumed: (@MainActor () -> Void)?
 
+    /// 软键盘定稿文字。返回 true 表示宿主已处理，视图不再逐字发键。
+    ///
+    /// 不设置、或返回 false 时，行为和上游 `insertText` 逐字发键一致。
+    /// 退格、回车、方向键、硬件键盘不经过这里。返回 true 时也不消耗粘滞修饰，
+    /// 宿主若自己发键，要自己处理 ``supplementalModifiers``。
+    @ObservationIgnored
+    public var onCommitText: (@MainActor (String) -> Bool)?
+
     /// Whether the software keyboard should be shown for the remote desktop.
     ///
     /// Two-way synced with `RemoteDesktopView`'s internal keyboard state:
@@ -196,5 +204,20 @@ public final class VNCKeyboardCapture {
     /// hardware-keyboard capture.
     public func routeReservedHostShortcutsToVNC(_ enabled: Bool) {
         routesReservedHostShortcutsToVNC = enabled
+    }
+}
+
+/// 软键盘定稿文字的分发。钩子返回 true 时不调用 `send`。
+@MainActor
+enum VNCSoftKeyboardCommit {
+    static func deliver(
+        _ text: String,
+        hook: (@MainActor (String) -> Bool)?,
+        send: (Character) -> Void
+    ) {
+        if hook?(text) == true { return }
+        for character in text {
+            send(character)
+        }
     }
 }

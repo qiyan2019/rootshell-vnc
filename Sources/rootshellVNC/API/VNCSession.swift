@@ -1558,7 +1558,7 @@ public final class VNCSession {
             case .pointer(let buttonMask, let x, let y):
                 sendPointerEvent(buttonMask: buttonMask, x: x, y: y)
             case .scroll, .gesture, .clipboard, .clipboardRequest,
-                 .sharedClipboard, .curtain:
+                 .pasteText, .sharedClipboard, .curtain:
                 assertionFailure("Unexpected event in login password sequence")
             }
         }
@@ -1715,6 +1715,23 @@ public final class VNCSession {
         }
 
         enqueueInput(.clipboard(text))
+    }
+
+    /// 把软键盘定稿文字贴进远端。
+    ///
+    /// 能力位 31 可用时写 Apple packed scrap、发 Cmd+V，再把之前的原始 scrap
+    /// 原样回发。不支持时退回逐字发键（与 `insertText` 相同，不含粘滞修饰）。
+    /// 不把文字或剪贴板内容写入日志。
+    public func pasteText(_ text: String) {
+        guard connectionState.isConnected, transportSession != nil else { return }
+        guard !text.isEmpty else { return }
+        if VNCTextPaste.usesPackedScrap(serverCapabilities) {
+            enqueueInput(.pasteText(text))
+        } else {
+            for event in VNCTextPaste.keyEvents(for: text) {
+                enqueueInput(.key(downFlag: event.downFlag, keysym: event.keysym))
+            }
+        }
     }
 
     /// Request the current remote clipboard from a capable Apple server.
@@ -3894,6 +3911,20 @@ public final class VNCSession {
                             "Failed to request remote clipboard: "
                                 + error.localizedDescription)
                     }
+                case .pasteText(let text):
+                    do {
+                        let pasted = try await transport.pasteCommittedText(text)
+                        if !pasted {
+                            let events = VNCTextPaste.keyEvents(for: text).map {
+                                ClientInputEvent.key(downFlag: $0.downFlag, key: $0.keysym)
+                            }
+                            try await transport.sendInputEvents(events)
+                        }
+                    } catch {
+                        self.logger.warning(
+                            "Failed to paste committed text: "
+                                + error.localizedDescription)
+                    }
                 case .sharedClipboard(let enabled):
                     do {
                         try await transport.setSharedClipboardEnabled(enabled)
@@ -4005,7 +4036,7 @@ public final class VNCSession {
         case .pointer(let buttonMask, let x, let y):
             return .pointer(buttonMask: buttonMask, x: x, y: y)
         case .pause, .scroll, .gesture, .clipboard, .clipboardRequest,
-             .sharedClipboard, .curtain:
+             .pasteText, .sharedClipboard, .curtain:
             return nil
         }
     }

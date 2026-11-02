@@ -18,6 +18,9 @@ public struct AppleServerCapabilities: Sendable, Equatable {
     public static let displayConfigurationCommand =
         AppleDisplayConfiguration.messageType
 
+    /// Apple packed-scrap 剪贴板命令（type 31）。没有这一位就不能走剪贴板粘贴。
+    public static let packedScrapCommand: UInt8 = 31
+
     public let serverFlags: UInt32
     public let serverCommandBitmap: Data
 
