@@ -31,7 +31,7 @@ private enum CalibrationError: Error {
 }
 
 @MainActor
-private final class MacLiveScrollCalibration {
+final class MacLiveScrollCalibration {
     private let passwordFile: String
     private let timelinePath: String
     private let host = "100.100.10.11"
@@ -55,13 +55,71 @@ private final class MacLiveScrollCalibration {
     func run() async throws {
         precondition(host == "100.100.10.11")
         let session = try await connect()
-        defer { session.disconnect() }
+        var probeStarted = false
+        defer {
+            if probeStarted { try? collectProbe() }
+            session.disconnect()
+        }
         try await unlockIfNeeded(session)
         try startProbe()
+        probeStarted = true
         try await Task.sleep(for: .seconds(2))
         try reportScale(session)
         try await runSamples(session)
+        try collectProbe()
+        probeStarted = false
         fflush(stderr)
+    }
+
+    /// 解锁一次后只保持连接，直到停止文件或到期。不再发输入。
+    func keep() async throws {
+        precondition(host == "100.100.10.11")
+        let session = try await connect()
+        defer { session.disconnect() }
+        try await unlockIfNeeded(session)
+        try "1".write(
+            toFile: "/private/tmp/agito-macmini-keeper/ready",
+            atomically: true, encoding: .utf8)
+        note("S0-KEEPER ready")
+        try await waitUntilKeeperStops()
+        note("S0-KEEPER stop")
+    }
+
+    /// 第二个观看者：连上再断开，不投递密码。
+    func watch() async throws {
+        precondition(host == "100.100.10.11")
+        let session = try await connect()
+        defer { session.disconnect() }
+        note("S0-WATCHER connected")
+        try await Task.sleep(for: .seconds(3))
+        note("S0-WATCHER closing")
+    }
+
+    private func waitUntilKeeperStops() async throws {
+        let stop = "/private/tmp/agito-macmini-keeper/stop"
+        let state = "/private/tmp/agito-macmini-keeper/state"
+        let fallback = Date().addingTimeInterval(keeperSeconds())
+        while Date() < fallback {
+            if FileManager.default.fileExists(atPath: stop) { return }
+            if let expiry = Self.keeperExpiry(state), Date() >= expiry { return }
+            try await Task.sleep(for: .seconds(1))
+        }
+    }
+
+    private func keeperSeconds() -> TimeInterval {
+        let raw = ProcessInfo.processInfo.environment["AGITO_SCROLL_KEEPER_SECONDS"] ?? "3600"
+        return TimeInterval(raw) ?? 3600
+    }
+
+    private static func keeperExpiry(_ path: String) -> Date? {
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+        for line in text.split(separator: "\n") {
+            let parts = line.split(separator: "=", maxSplits: 1)
+            guard parts.count == 2, parts[0] == "expiry_epoch" else { continue }
+            guard let epoch = TimeInterval(parts[1]) else { return nil }
+            return Date(timeIntervalSince1970: epoch)
+        }
+        return nil
     }
 
     private func connect() async throws -> VNCSession {
@@ -425,8 +483,7 @@ private final class MacLiveScrollCalibration {
 
     /// 解锁之后才把探针放到屏幕上，避免它盖住密码框。
     private func startProbe() throws {
-        let script = ProcessInfo.processInfo.environment["AGITO_SCROLL_PROBE_SCRIPT"]
-            ?? "/Users/melody/Source/llm/Agito-worktrees/vnc-scroll-S0/Agito/native/test-vnc/mac-scroll.sh"
+        let script = probeScript()
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [script, "probe-start"]
@@ -446,12 +503,48 @@ private final class MacLiveScrollCalibration {
         note("S0-PROBE started")
     }
 
+    /// 还连着的时候把探针日志拷回来，然后再断开。断开会使 Mac 重新锁屏。
+    private func collectProbe() throws {
+        let script = probeScript()
+        let dest = ProcessInfo.processInfo.environment["AGITO_SCROLL_PROBE_LOG"]
+            ?? "/tmp/agito-s0-calibration.jsonl"
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = [script, "probe-collect", dest]
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        do {
+            try process.run()
+        } catch {
+            note("S0-FAIL probe-collect")
+            throw CalibrationError.probe
+        }
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            note("S0-FAIL probe-collect")
+            throw CalibrationError.probe
+        }
+        note("S0-PROBE collected")
+    }
+
+    private func probeScript() -> String {
+        ProcessInfo.processInfo.environment["AGITO_SCROLL_PROBE_SCRIPT"]
+            ?? "/Users/melody/Source/llm/Agito-worktrees/vnc-scroll-S0/Agito/native/test-vnc/mac-scroll.sh"
+    }
+
+    /// 找不到 `<true/>` 也要退出码 0。解锁后 grep 返回 1，不能当成 ssh 失败。
     private func lockFlags() throws -> (trues: Int, falses: Int) {
         let output = try ssh(
-            "ioreg -n Root -d1 -a | plutil -extract IOConsoleUsers xml1 -o - - | grep -A1 CGSSessionScreenIsLocked")
-        let trues = output.components(separatedBy: "<true/>").count - 1
-        let falses = output.components(separatedBy: "<false/>").count - 1
-        return (trues, falses)
+            "if ioreg -n Root -d1 -a | plutil -extract IOConsoleUsers xml1 -o - - "
+                + "| grep -A1 CGSSessionScreenIsLocked | grep -q '<true/>'; "
+                + "then echo locked; else echo unlocked; fi")
+        switch output.trimmingCharacters(in: .whitespacesAndNewlines) {
+        case "locked": return (1, 0)
+        case "unlocked": return (0, 1)
+        default:
+            note("S0-FAIL lock-ambiguous")
+            throw CalibrationError.lockQuery
+        }
     }
 
     private func reportScale(_ session: VNCSession) throws {
@@ -625,46 +718,6 @@ private enum LoginEvidence: String {
     case signal
     case visual
     case none
-}
-
-/// 12×8 量化亮度，和 App `ScreenSharingFrameSignature` 同一条规则。只在内存里比较。
-private struct FrameSignature: Equatable {
-    static let columns = 12
-    static let rows = 8
-    let cells: [UInt8]
-
-    init?(image: CGImage) {
-        var pixels = [UInt8](repeating: 0, count: Self.columns * Self.rows * 4)
-        let drawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
-            guard let context = CGContext(
-                data: buffer.baseAddress,
-                width: Self.columns,
-                height: Self.rows,
-                bitsPerComponent: 8,
-                bytesPerRow: Self.columns * 4,
-                space: CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
-                    | CGBitmapInfo.byteOrder32Little.rawValue)
-            else { return false }
-            context.interpolationQuality = .none
-            context.draw(image, in: CGRect(x: 0, y: 0, width: Self.columns, height: Self.rows))
-            return true
-        }
-        guard drawn else { return nil }
-        cells = stride(from: 0, to: pixels.count, by: 4).map { offset in
-            let blue = Int(pixels[offset])
-            let green = Int(pixels[offset + 1])
-            let red = Int(pixels[offset + 2])
-            return UInt8(((red * 77 + green * 150 + blue * 29) >> 8) >> 4)
-        }
-    }
-
-    func isMajorChange(from other: FrameSignature) -> Bool {
-        let count = min(cells.count, other.cells.count)
-        guard count > 0 else { return false }
-        let changed = (0..<count).filter { abs(Int(cells[$0]) - Int(other.cells[$0])) > 2 }.count
-        return Double(changed) / Double(count) > 0.25
-    }
 }
 
 @MainActor
