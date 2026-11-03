@@ -38,6 +38,10 @@ struct RemoteInteractionView: UIViewRepresentable {
     let remoteCursor: RemoteCursor?
     let remoteCursorPresence: RemoteCursorPresence
     let isViewOnly: Bool
+    /// 触摸滚动调参与远端像素换算（帧缓冲像素 / 远端 point），
+    /// 只作用于直接触摸路径；UIEvent.scroll 原生路径不受影响。
+    let scrollTuning: RemoteScrollTuning
+    let remotePixelsPerPoint: CGFloat
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -94,7 +98,9 @@ struct RemoteInteractionView: UIViewRepresentable {
             disconnect: disconnect,
             remoteCursor: remoteCursor,
             remoteCursorPresence: remoteCursorPresence,
-            isViewOnly: isViewOnly)
+            isViewOnly: isViewOnly,
+            scrollTuning: scrollTuning,
+            remotePixelsPerPoint: remotePixelsPerPoint)
     }
 
     @MainActor
@@ -181,6 +187,12 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     private var syntheticMomentumVelocity = CGPoint.zero
     private var syntheticMomentumLastTimestamp: CFTimeInterval = 0
     private var momentumDisplayLink: CADisplayLink?
+    /// 触摸滚动调参：直接触摸路径的缩放补偿 / 速度增益 / 惯性 / 叠加。
+    private var scrollTuning = RemoteScrollTuning()
+    /// 帧缓冲像素 / 远端 point（Apple 虚拟显示器恒为 2，其余为 1）。
+    private var remotePixelsPerPoint: CGFloat = 1
+    /// 连续甩叠加：接住惯性时记录剩余屏幕速度，下一次抬手并入初速。
+    private var flickStacker = FlickStacker()
     private var edgeScrollPointerLocation: CGPoint?
     private var edgeScrollLastTimestamp: CFTimeInterval = 0
     private var edgeScrollIsDragging = false
@@ -856,7 +868,9 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         disconnect: @escaping () -> Void,
         remoteCursor: RemoteCursor?,
         remoteCursorPresence: RemoteCursorPresence,
-        isViewOnly: Bool
+        isViewOnly: Bool,
+        scrollTuning: RemoteScrollTuning,
+        remotePixelsPerPoint: CGFloat
     ) {
         if hardwareKeyboard.controlOptionAsCommand != controlOptionAsCommand {
             releaseAllPressedKeys()
@@ -885,6 +899,8 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         self.requestDictation = requestDictation
         self.toggleFullScreen = toggleFullScreen
         self.disconnect = disconnect
+        self.scrollTuning = scrollTuning
+        self.remotePixelsPerPoint = remotePixelsPerPoint
         self.viewport.clampOffset(
             viewSize: bounds.size,
             framebufferSize: framebufferSize)
@@ -2183,16 +2199,35 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     @discardableResult
     private func beginSyntheticMomentumIfNeeded() -> Bool {
         guard momentumDisplayLink == nil else { return false }
+        let now = CACurrentMediaTime()
         let releaseVelocity = releaseVelocityEstimator.releaseVelocity(
-            at: CACurrentMediaTime())
-        let speed = hypot(releaseVelocity.x, releaseVelocity.y)
-        guard speed >= 25 else { return false }
+            at: now)
+        if activeScrollUsesDirectTouch {
+            // 接住过的惯性先并入本次释放速度，再按屏幕速度判定
+            // 门槛与上限；惯性内部状态用远端点速度（屏幕速度 × 增益）。
+            let stacked = flickStacker.stackedReleaseVelocity(
+                releaseVelocity, at: now, tuning: scrollTuning)
+            guard let initial = ScrollGain.momentumInitialVelocity(
+                releaseVelocity: stacked,
+                s: scrollScreenUnitsPerRemotePoint,
+                horizontallyLocked: horizontalScrollIntentFilter
+                    .isHorizontallyLocked,
+                tuning: scrollTuning) else { return false }
+            syntheticMomentumVelocity = CGPoint(
+                x: initial.screenVelocity.x * initial.gain,
+                y: initial.screenVelocity.y * initial.gain)
+        } else {
+            // UIEvent.scroll 原生路径不变：样本已带系统加速，
+            // 沿用屏幕单位的门槛、上限与衰减。
+            let speed = hypot(releaseVelocity.x, releaseVelocity.y)
+            guard speed >= 25 else { return false }
 
-        let maximumSpeed: CGFloat = 12_000
-        let scale = min(1, maximumSpeed / speed)
-        syntheticMomentumVelocity = CGPoint(
-            x: releaseVelocity.x * scale,
-            y: releaseVelocity.y * scale)
+            let maximumSpeed: CGFloat = 12_000
+            let scale = min(1, maximumSpeed / speed)
+            syntheticMomentumVelocity = CGPoint(
+                x: releaseVelocity.x * scale,
+                y: releaseVelocity.y * scale)
+        }
         syntheticMomentumLastTimestamp = 0
         beginMomentumScrollPhaseIfNeeded()
 
@@ -2221,17 +2256,30 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
         }
         syntheticMomentumLastTimestamp = displayLink.timestamp
 
-        sendFilteredScrollDelta(
-            deltaX: syntheticMomentumVelocity.x * elapsed,
-            deltaY: syntheticMomentumVelocity.y * elapsed,
+        // 直接触摸路径的惯性增量已是远端点单位（初速时乘过增益），
+        // 直发不再过意图过滤与增益；原生路径本来就是屏幕单位直发，
+        // 与原 passthrough 行为一致。
+        sendAccumulatedScrollDelta(
+            CGPoint(
+                x: syntheticMomentumVelocity.x * elapsed,
+                y: syntheticMomentumVelocity.y * elapsed),
             scrollPhase: .none,
             momentumPhase: .changed)
 
         // UIScrollView.DecelerationRate.normal is 0.998 per millisecond.
-        let decay = pow(CGFloat(0.998), CGFloat(elapsed * 1_000))
-        syntheticMomentumVelocity.x *= decay
-        syntheticMomentumVelocity.y *= decay
-        if hypot(syntheticMomentumVelocity.x, syntheticMomentumVelocity.y) < 5 {
+        syntheticMomentumVelocity = ScrollGain.decayedMomentumVelocity(
+            syntheticMomentumVelocity, elapsed: elapsed)
+        let speed = hypot(syntheticMomentumVelocity.x,
+                          syntheticMomentumVelocity.y)
+        // 停止阈值换回屏幕速度判定：远端速度 × s < stopSpeed；
+        // 原生路径速度本来就是屏幕单位，保持原比较。
+        let shouldStop = activeScrollUsesDirectTouch
+            ? ScrollGain.shouldStopMomentum(
+                remoteSpeed: speed,
+                s: scrollScreenUnitsPerRemotePoint,
+                tuning: scrollTuning)
+            : speed < 5
+        if shouldStop {
             endMomentumScrollPhase()
             finishScrollInteraction()
         }
@@ -2277,6 +2325,16 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     @discardableResult
     private func catchMomentumFlingIfActive() -> Bool {
         guard momentumScrollPhaseActive else { return false }
+        // 被接住的剩余动量换回屏幕速度记下，下一次抬手并入初速；
+        // 直接触摸的惯性是远端点单位，原生路径本来就是屏幕单位。
+        let caught = activeScrollUsesDirectTouch
+            ? CGPoint(
+                x: syntheticMomentumVelocity.x
+                    * scrollScreenUnitsPerRemotePoint,
+                y: syntheticMomentumVelocity.y
+                    * scrollScreenUnitsPerRemotePoint)
+            : syntheticMomentumVelocity
+        flickStacker.recordCatch(velocity: caught, at: CACurrentMediaTime())
         endMomentumScrollPhase()
         finishScrollInteraction()
         return true
@@ -2370,6 +2428,21 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             momentumPhase: momentumPhase)
     }
 
+    /// 屏幕单位 / 远端点 = P /（帧缓冲像素 / 屏幕点）。视口几何未建立时
+    /// `captureScrollPoint` 同样取不到点、滚动事件发不出去，这里退化到 P
+    /// 只影响速度换算。
+    private var scrollScreenUnitsPerRemotePoint: CGFloat {
+        remotePixelsPerPoint / (viewport.framebufferPixelsPerPoint(
+            viewSize: bounds.size, framebufferSize: framebufferSize) ?? 1)
+    }
+
+    /// 当前手势的屏幕速度估计：与抬手估计共用同一条 100ms 尾窗。
+    private func currentScrollScreenSpeed() -> CGFloat {
+        let velocity = releaseVelocityEstimator.releaseVelocity(
+            at: CACurrentMediaTime())
+        return hypot(velocity.x, velocity.y)
+    }
+
     private func sendFilteredScrollDelta(
         deltaX: CGFloat,
         deltaY: CGFloat,
@@ -2381,14 +2454,16 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
             filtered = horizontalScrollIntentFilter.consume(
                 deltaX: deltaX,
                 deltaY: deltaY)
-            if horizontalScrollIntentFilter.isHorizontallyLocked {
-                // Trackpad scroll events already contain system acceleration;
-                // raw finger translation does not. A modest horizontal gain
-                // lets AppKit's fluid swipe tracking reach the commit distance
-                // during an ordinary finger stroke instead of requiring an
-                // edge-to-edge fling.
-                filtered.x *= 2
-            }
+            // 意图判定在屏幕单位内完成后才乘增益：缩放补偿 × 速度增益；
+            // 横向锁定时取 horizontalMinGain 下限、不乘 G_speed。
+            let gain = ScrollGain.dragGain(
+                screenSpeed: currentScrollScreenSpeed(),
+                s: scrollScreenUnitsPerRemotePoint,
+                horizontallyLocked: horizontalScrollIntentFilter
+                    .isHorizontallyLocked,
+                tuning: scrollTuning)
+            filtered.x *= gain
+            filtered.y *= gain
         } else {
             // UIKit's UIEvent.scroll stream already carries the trackpad's
             // native directional intent. Preserve it byte-for-byte instead
@@ -2413,9 +2488,16 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
 
     private func flushPendingScrollDelta() {
         guard activeScrollUsesDirectTouch else { return }
-        sendAccumulatedScrollDelta(
-            horizontalScrollIntentFilter.flush(),
-            scrollPhase: .changed)
+        var pending = horizontalScrollIntentFilter.flush()
+        // flush 把未决手势落到 unrestricted，末尾样本按同一套增益收尾
+        let gain = ScrollGain.dragGain(
+            screenSpeed: currentScrollScreenSpeed(),
+            s: scrollScreenUnitsPerRemotePoint,
+            horizontallyLocked: false,
+            tuning: scrollTuning)
+        pending.x *= gain
+        pending.y *= gain
+        sendAccumulatedScrollDelta(pending, scrollPhase: .changed)
     }
 
     private func sendAccumulatedScrollDelta(

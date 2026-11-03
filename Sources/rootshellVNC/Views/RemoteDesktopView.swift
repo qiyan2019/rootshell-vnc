@@ -87,6 +87,8 @@ public struct RemoteDesktopView: View {
     /// host owns this because only it knows the display the desktop is being
     /// viewed on and what the user asked for.
     private let cursorHeight: CGFloat
+    /// 触摸滚动调参：缩放补偿、速度增益、惯性与叠加阈值。
+    private let scrollTuning: RemoteScrollTuning
 
     #if canImport(UIKit)
     /// A host-provided accessory can remain visible without the software
@@ -114,7 +116,8 @@ public struct RemoteDesktopView: View {
         showsBuiltInControls: Bool = true,
         pointerMode: Binding<RemotePointerMode>? = nil,
         onViewportZoomChange: (@MainActor (Bool) -> Void)? = nil,
-        onLoginPasswordRequest: (@MainActor () -> Void)? = nil
+        onLoginPasswordRequest: (@MainActor () -> Void)? = nil,
+        scrollTuning: RemoteScrollTuning = .default
     ) {
         self.init(
             session: session,
@@ -134,6 +137,7 @@ public struct RemoteDesktopView: View {
             pointerMode: pointerMode,
             onViewportZoomChange: onViewportZoomChange,
             onLoginPasswordRequest: onLoginPasswordRequest,
+            scrollTuning: scrollTuning,
             hudMenuExtras: nil)
     }
 
@@ -161,6 +165,7 @@ public struct RemoteDesktopView: View {
         pointerMode: Binding<RemotePointerMode>? = nil,
         onViewportZoomChange: (@MainActor (Bool) -> Void)? = nil,
         onLoginPasswordRequest: (@MainActor () -> Void)? = nil,
+        scrollTuning: RemoteScrollTuning = .default,
         @ViewBuilder hudMenuExtras: () -> MenuExtras
     ) {
         self.init(
@@ -181,6 +186,7 @@ public struct RemoteDesktopView: View {
             pointerMode: pointerMode,
             onViewportZoomChange: onViewportZoomChange,
             onLoginPasswordRequest: onLoginPasswordRequest,
+            scrollTuning: scrollTuning,
             hudMenuExtras: AnyView(hudMenuExtras()))
     }
 
@@ -202,6 +208,7 @@ public struct RemoteDesktopView: View {
         pointerMode: Binding<RemotePointerMode>?,
         onViewportZoomChange: (@MainActor (Bool) -> Void)?,
         onLoginPasswordRequest: (@MainActor () -> Void)?,
+        scrollTuning: RemoteScrollTuning,
         hudMenuExtras: AnyView?
     ) {
         self.session = session
@@ -215,6 +222,7 @@ public struct RemoteDesktopView: View {
         self._pointerMode = State(initialValue: initialPointerMode)
         self.pointerSpeed = pointerSpeed
         self.cursorHeight = cursorHeight
+        self.scrollTuning = scrollTuning
         self._keyboardCapture = State(
             initialValue: keyboardCapture ?? VNCKeyboardCapture())
         self.isFullScreen = isFullScreen
@@ -468,7 +476,12 @@ public struct RemoteDesktopView: View {
             // images so the responsive local pointer can adopt their shape.
             remoteCursor: session.remoteCursor,
             remoteCursorPresence: session.remoteCursorPresence,
-            isViewOnly: session.isViewOnly)
+            isViewOnly: session.isViewOnly,
+            scrollTuning: scrollTuning,
+            remotePixelsPerPoint: ScrollGain.resolvedRemotePixelsPerPoint(
+                override: scrollTuning.remotePixelsPerPoint,
+                isAppleVirtualDisplay: session.configuration
+                    .displaySizingMode == .matchClient))
             .frame(width: viewSize.width, height: viewSize.height)
             .contentShape(Rectangle())
         #else
