@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import RFBProtocol
 import XCTest
@@ -22,7 +23,6 @@ private enum CalibrationError: Error {
     case identity
     case auth
     case unlock
-    case field
     case lockQuery
     case notReady
     case probe
@@ -171,32 +171,94 @@ private final class MacLiveScrollCalibration {
         }
     }
 
-    /// 先唤醒，等密码行被识别出来再投递一次。认不出来就不投。
+    /// 照 `runLoginSend`。锁屏位是信号证据，不等 vision。这一轮只投递一次。
     private func unlockIfNeeded(_ session: VNCSession) async throws {
         guard try consoleIsLocked() else { return }
         await waitForFirstFrame(session)
-        await wakeScreen(session)
-        try await waitForPasswordField(session)
-        let watch = LockWatch()
-        let polling = Task.detached {
-            while !Task.isCancelled {
-                if let sample = RemoteLock.sample() {
-                    watch.store(locked: sample.locked, querySeconds: sample.seconds)
-                }
-                try? await Task.sleep(for: .milliseconds(300))
-            }
+        await waitForEvidence(session)
+        let evidence = loginEvidence(session)
+        note("S0-EVIDENCE \(evidence.rawValue)")
+        note(surfaceLine(session))
+        mark("evidence")
+        if evidence != .none {
+            wakeRemote(session)
+            mark("wake")
+            try await Task.sleep(for: .milliseconds(1200))
+            mark("settle")
         }
-        defer {
-            polling.cancel()
-            for line in watch.drain() { note(line) }
-        }
-        let delivery = try await deliverOnce(session, watch: watch)
-        note("S0-DELIVERY \(delivery)")
-        if delivery == "skipped" { return }
-        try await waitUnlocked(watch)
+        try await deliverAfterQuiet(session, evidence: evidence)
     }
 
-    /// 首帧之后再唤醒，和 `wakeScreenAfterFirstFrame` 一样。
+    private func deliverAfterQuiet(
+        _ session: VNCSession, evidence: LoginEvidence
+    ) async throws {
+        guard await waitForLoginQuiet(session, evidence: evidence) else {
+            mark("quiet-abort")
+            try await stopUnlessConsoleOpen(session)
+            return
+        }
+        mark("quiet")
+        let signature = session.currentImage.flatMap(FrameSignature.init(image:))
+        mark("signature")
+        note("S0-SIGNATURE has=\(signature != nil)")
+        let delivery = await session.sendLoginPassword(shouldContinue: { @MainActor in
+            self.deliveryShouldContinue(session, evidence: evidence, signature: signature)
+        })
+        note("S0-DELIVERY \(Self.deliveryName(delivery))")
+        mark("delivery")
+        guard delivery != .notSent else {
+            note("S0-RECHECK skipped")
+            note("S0-BLOCK unlock")
+            throw CalibrationError.unlock
+        }
+        let result = await recheckLogin(session, evidence: evidence, signature: signature)
+        note("S0-RECHECK \(result)")
+        note(surfaceLine(session))
+        mark("recheck")
+        guard result == "cleared" else {
+            _ = try? consoleIsLocked()
+            note("S0-BLOCK unlock")
+            throw CalibrationError.unlock
+        }
+        try await confirmConsoleUnlocked()
+    }
+
+    /// 信号消失表示已经解开，密码不能再打进桌面。安静超时则不投递。
+    private func stopUnlessConsoleOpen(_ session: VNCSession) async throws {
+        if try !consoleIsLocked() {
+            note("S0-DELIVERY skipped")
+            note("S0-UNLOCKED")
+            return
+        }
+        note(surfaceLine(session))
+        note("S0-BLOCK unlock")
+        throw CalibrationError.unlock
+    }
+
+    /// 会话标志先清，ioreg 可能晚一点。最多再等 5 秒，不再投递。
+    private func confirmConsoleUnlocked() async throws {
+        let deadline = Date().addingTimeInterval(5)
+        while true {
+            if try !consoleIsLocked() {
+                note("S0-UNLOCKED")
+                return
+            }
+            if Date() >= deadline {
+                note("S0-BLOCK unlock")
+                throw CalibrationError.unlock
+            }
+            try await Task.sleep(for: .milliseconds(400))
+        }
+    }
+
+    /// 公告可能比首帧晚到。ioreg 已经是锁屏时，先等信号，避免把这一轮标成没有证据。
+    private func waitForEvidence(_ session: VNCSession) async {
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline, loginEvidence(session) == .none {
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+    }
+
     private func waitForFirstFrame(_ session: VNCSession) async {
         let deadline = Date().addingTimeInterval(8)
         while Date() < deadline, session.currentImage == nil {
@@ -205,64 +267,132 @@ private final class MacLiveScrollCalibration {
         note("S0-FRAME image=\(session.currentImage != nil)")
     }
 
-    /// Shift 按下再松开，锁屏或登录窗再 `nudgePointer`。不产生字符。
-    private func wakeScreen(_ session: VNCSession) async {
+    /// 左 Shift 按下再松开，不动光标。抬起和 1.2 秒等待重叠，和 `wakeRemote` 一样。
+    private func wakeRemote(_ session: VNCSession) {
         let shift = KeyboardInputHandler.keysymShiftL
         session.sendKeyEvent(downFlag: true, key: shift)
-        try? await Task.sleep(for: .milliseconds(30))
-        session.sendKeyEvent(downFlag: false, key: shift)
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(30))
+            session.sendKeyEvent(downFlag: false, key: shift)
+        }
+        note("S0-WAKE shift")
+    }
+
+    /// 5 秒内要有连续 0.7 秒画面不大变。信号证据中途消失就中止。
+    private func waitForLoginQuiet(
+        _ session: VNCSession, evidence: LoginEvidence
+    ) async -> Bool {
+        let start = Date()
+        var quietSince = start
+        var signature = session.currentImage.flatMap(FrameSignature.init(image:))
+        while Date().timeIntervalSince(start) < 5 {
+            if evidence == .signal, !signalActive(session) {
+                note("S0-QUIET signal-gone")
+                return false
+            }
+            let latest = session.currentImage.flatMap(FrameSignature.init(image:))
+            if let signature, let latest, latest.isMajorChange(from: signature) {
+                quietSince = Date()
+            }
+            signature = latest
+            if Date().timeIntervalSince(quietSince) >= 0.7 { return true }
+            try? await Task.sleep(for: .milliseconds(60))
+        }
+        note("S0-QUIET timeout")
+        return false
+    }
+
+    /// 信号：锁屏位还在才继续。视觉：相对发送签名不是大变。没有证据就一直继续。
+    private func deliveryShouldContinue(
+        _ session: VNCSession,
+        evidence: LoginEvidence,
+        signature: FrameSignature?
+    ) -> Bool {
+        switch evidence {
+        case .signal:
+            return signalActive(session)
+        case .visual:
+            guard let signature,
+                  let latest = session.currentImage.flatMap(FrameSignature.init(image:))
+            else { return true }
+            return !latest.isMajorChange(from: signature)
+        case .none:
+            return true
+        }
+    }
+
+    /// 信号复检：锁屏位变假就是解开。10 秒还在登录界面记 maybeWrong。
+    private func recheckLogin(
+        _ session: VNCSession,
+        evidence: LoginEvidence,
+        signature: FrameSignature?
+    ) async -> String {
+        guard evidence != .none, session.connectionState.isConnected else { return "skipped" }
+        let start = Date()
+        var changedSince: Date?
+        while Date().timeIntervalSince(start) < 10 {
+            guard session.connectionState.isConnected else { return "disconnected" }
+            if let verdict = await recheckSample(
+                session, evidence: evidence, signature: signature, changedSince: &changedSince
+            ) { return verdict }
+            try? await Task.sleep(for: .milliseconds(60))
+        }
+        guard session.connectionState.isConnected else { return "disconnected" }
+        if evidence == .visual, await visualCleared(session) { return "cleared" }
+        return "maybeWrong"
+    }
+
+    private func recheckSample(
+        _ session: VNCSession,
+        evidence: LoginEvidence,
+        signature: FrameSignature?,
+        changedSince: inout Date?
+    ) async -> String? {
+        switch evidence {
+        case .signal:
+            return signalActive(session) ? nil : "cleared"
+        case .visual:
+            return await visualRecheck(session, signature: signature, changedSince: &changedSince)
+        case .none:
+            return "skipped"
+        }
+    }
+
+    /// 大变持续满 1 秒再 OCR 一次。识别失败按「不是登录界面」。
+    private func visualRecheck(
+        _ session: VNCSession,
+        signature: FrameSignature?,
+        changedSince: inout Date?
+    ) async -> String? {
+        guard let signature,
+              let latest = session.currentImage.flatMap(FrameSignature.init(image:)),
+              latest.isMajorChange(from: signature) else { return nil }
+        if changedSince == nil { changedSince = Date() }
+        guard let since = changedSince, Date().timeIntervalSince(since) >= 1 else { return nil }
+        return await visualCleared(session) ? "cleared" : "maybeWrong"
+    }
+
+    private func visualCleared(_ session: VNCSession) async -> Bool {
+        guard let image = session.currentImage else { return true }
+        return await !VNCLoginScreenRecognizer.isLoginScreen(image)
+    }
+
+    private func loginEvidence(_ session: VNCSession) -> LoginEvidence {
+        if signalActive(session) { return .signal }
+        if session.remoteLoginVisionDetected { return .visual }
+        return .none
+    }
+
+    private func signalActive(_ session: VNCSession) -> Bool {
         let surface = session.remoteLoginSurface
-        let nudge = surface.isLockScreen || surface.isLoginWindow
-        if nudge { session.nudgePointer() }
-        note("S0-WAKE shift nudge=\(nudge) image=\(session.currentImage != nil)")
+        return surface.isLockScreen || surface.isLoginWindow
     }
 
-    /// 最多 20 秒。4 秒还没有密码行就再唤醒一次，因为休眠时第一次输入会被吃掉。
-    private func waitForPasswordField(_ session: VNCSession) async throws {
-        let deadline = Date().addingTimeInterval(20)
-        let repeatAt = Date().addingTimeInterval(4)
-        var nudgedAgain = false
-        var nextLog = Date()
-        while Date() < deadline {
-            if passwordFieldReady(session) {
-                note(surfaceLine(session))
-                return
-            }
-            if Date() >= nextLog {
-                note(surfaceLine(session) + " image=\(session.currentImage != nil)")
-                nextLog = Date().addingTimeInterval(2)
-            }
-            if !nudgedAgain, Date() >= repeatAt {
-                nudgedAgain = true
-                await wakeScreen(session)
-            }
-            try await Task.sleep(for: .milliseconds(200))
-        }
-        note(surfaceLine(session) + " image=\(session.currentImage != nil)")
-        note("S0-BLOCK field")
-        throw CalibrationError.field
+    private func mark(_ name: String) {
+        note(String(format: "S0-STAGE %@ wall=%.3f", name, Date().timeIntervalSince1970))
     }
 
-    /// 指挥的两条是 vision，或「登录窗/锁屏并且认出密码行」。
-    /// 密码行坐标不公开，和 vision 同一次写上，公告单独成立不算。
-    private func passwordFieldReady(_ session: VNCSession) -> Bool {
-        session.remoteLoginVisionDetected
-    }
-
-    /// 投递前 2 秒内再查一次。锁屏已经翻成 false 时 `shouldContinue` 返回 false。
-    private func deliverOnce(_ session: VNCSession, watch: LockWatch) async throws -> String {
-        guard let sample = RemoteLock.sample() else {
-            note("S0-FAIL lock-query")
-            throw CalibrationError.lockQuery
-        }
-        watch.store(locked: sample.locked, querySeconds: sample.seconds)
-        note(String(
-            format: "S0-LOCK-SEND locked=%@ query_s=%.3f",
-            sample.locked ? "true" : "false", sample.seconds))
-        guard sample.locked else { return "skipped" }
-        let delivery = await session.sendLoginPassword(shouldContinue: { @MainActor in
-            watch.shouldContinue()
-        })
+    private static func deliveryName(_ delivery: VNCLoginPasswordDelivery) -> String {
         switch delivery {
         case .delivered: return "delivered"
         case .stopped: return "stopped"
@@ -291,20 +421,6 @@ private final class MacLiveScrollCalibration {
         if locked.falses > 0, locked.trues == 0 { return false }
         note("S0-FAIL lock-ambiguous")
         throw CalibrationError.lockQuery
-    }
-
-    /// 投递之后最多再等 10 秒。查询在后台走，主线程继续收帧。
-    private func waitUnlocked(_ watch: LockWatch) async throws {
-        let deadline = Date().addingTimeInterval(10)
-        while Date() < deadline {
-            if watch.freshUnlocked() {
-                note("S0-UNLOCKED")
-                return
-            }
-            try await Task.sleep(for: .milliseconds(200))
-        }
-        note("S0-BLOCK unlock")
-        throw CalibrationError.unlock
     }
 
     /// 解锁之后才把探针放到屏幕上，避免它盖住密码框。
@@ -505,68 +621,49 @@ private final class MacLiveScrollCalibration {
     }
 }
 
-/// 投递期间的锁屏采样。查询在后台，`shouldContinue` 只读最近 2 秒内的结果。
-private final class LockWatch: @unchecked Sendable {
-    private let gate = NSLock()
-    private var locked = true
-    private var at = Date.distantPast
-    private var lines: [String] = []
-
-    func store(locked: Bool, querySeconds: Double) {
-        gate.lock()
-        self.locked = locked
-        at = Date()
-        lines.append(String(
-            format: "S0-IOREG wall=%.3f locked=%@ query_s=%.3f",
-            at.timeIntervalSince1970, locked ? "true" : "false", querySeconds))
-        gate.unlock()
-    }
-
-    func shouldContinue() -> Bool {
-        gate.lock()
-        defer { gate.unlock() }
-        return locked && Date().timeIntervalSince(at) < 2
-    }
-
-    func freshUnlocked() -> Bool {
-        gate.lock()
-        defer { gate.unlock() }
-        return !locked && Date().timeIntervalSince(at) < 2
-    }
-
-    func drain() -> [String] {
-        gate.lock()
-        defer { gate.unlock() }
-        let copy = lines
-        lines.removeAll()
-        return copy
-    }
+private enum LoginEvidence: String {
+    case signal
+    case visual
+    case none
 }
 
-/// macmini 的 `CGSSessionScreenIsLocked`。慢于 2 秒或真假并存则丢掉。
-private enum RemoteLock {
-    static func sample() -> (locked: Bool, seconds: Double)? {
-        let started = Date()
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
-        process.arguments = [
-            "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "macmini",
-            "ioreg -n Root -d1 -a | plutil -extract IOConsoleUsers xml1 -o - - "
-                + "| grep -A1 CGSSessionScreenIsLocked",
-        ]
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
-        guard (try? process.run()) != nil else { return nil }
-        process.waitUntilExit()
-        let seconds = Date().timeIntervalSince(started)
-        guard process.terminationStatus == 0, seconds < 2 else { return nil }
-        let text = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        let trues = text.components(separatedBy: "<true/>").count - 1
-        let falses = text.components(separatedBy: "<false/>").count - 1
-        if trues > 0, falses == 0 { return (true, seconds) }
-        if falses > 0, trues == 0 { return (false, seconds) }
-        return nil
+/// 12×8 量化亮度，和 App `ScreenSharingFrameSignature` 同一条规则。只在内存里比较。
+private struct FrameSignature: Equatable {
+    static let columns = 12
+    static let rows = 8
+    let cells: [UInt8]
+
+    init?(image: CGImage) {
+        var pixels = [UInt8](repeating: 0, count: Self.columns * Self.rows * 4)
+        let drawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
+            guard let context = CGContext(
+                data: buffer.baseAddress,
+                width: Self.columns,
+                height: Self.rows,
+                bitsPerComponent: 8,
+                bytesPerRow: Self.columns * 4,
+                space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                    | CGBitmapInfo.byteOrder32Little.rawValue)
+            else { return false }
+            context.interpolationQuality = .none
+            context.draw(image, in: CGRect(x: 0, y: 0, width: Self.columns, height: Self.rows))
+            return true
+        }
+        guard drawn else { return nil }
+        cells = stride(from: 0, to: pixels.count, by: 4).map { offset in
+            let blue = Int(pixels[offset])
+            let green = Int(pixels[offset + 1])
+            let red = Int(pixels[offset + 2])
+            return UInt8(((red * 77 + green * 150 + blue * 29) >> 8) >> 4)
+        }
+    }
+
+    func isMajorChange(from other: FrameSignature) -> Bool {
+        let count = min(cells.count, other.cells.count)
+        guard count > 0 else { return false }
+        let changed = (0..<count).filter { abs(Int(cells[$0]) - Int(other.cells[$0])) > 2 }.count
+        return Double(changed) / Double(count) > 0.25
     }
 }
 
