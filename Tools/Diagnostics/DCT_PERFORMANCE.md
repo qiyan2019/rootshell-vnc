@@ -70,3 +70,20 @@ Tools/Diagnostics/check_apple_dct_kernel.sh --sanitize
 
 Run benchmarks without other builds or CPU-heavy tasks in flight. `draw=false`
 suppresses DCT pixel generation but retains existing solid/palette/copy writes.
+
+## Decoder injection (2026-11-04)
+
+Hosts can replace the decoder before creating any session. `FramebufferRenderer`
+asks `AppleDCTDecoderRegistry.makeDecoder()` for an `AppleDCTDecoding`
+(`Sources/RFBRendering/Framebuffer/AppleDCTDecoding.swift`); without a
+registration it keeps using the built-in Swift `AppleAdaptiveDCTDecoder`, which
+stays in the tree as the default and as the differential reference
+(`AppleDCTDecoderRegistry.makeSwiftDecoder()`).
+
+Agito registers its C decoder (`mobile/modules/agito-vnc/android/src/main/cpp`,
+compiled once through a single-translation-unit unity file under
+`Sources/CAgitoVncDct` with `-O3`; the fork itself carries no C decoder copy).
+To hand raw pixel access to an injected decoder, `Framebuffer.writeGeneration`
+and `withUnsafeMutablePixelBytes` are public — semantics unchanged: the write
+generation still increments once per compound render so an injected decoder can
+invalidate its tile tags after foreign writes.

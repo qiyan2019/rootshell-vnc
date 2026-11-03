@@ -20,7 +20,7 @@ enum AppleAdaptiveDCTError: Error, LocalizedError {
 /// sends quantization changes (type 2) independently from image commands
 /// (type 0), and later image commands may reference tiles decoded by any
 /// earlier rectangle, so one instance must live for the whole connection.
-final class AppleAdaptiveDCTDecoder {
+final class AppleAdaptiveDCTDecoder: AppleDCTDecoding {
     struct BitReader {
         // Borrowed only within the enclosing Data.withUnsafeBytes call.
         private let bytes: UnsafeRawBufferPointer

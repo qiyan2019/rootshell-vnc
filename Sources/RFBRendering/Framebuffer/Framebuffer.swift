@@ -164,7 +164,7 @@ public final class Framebuffer: @unchecked Sendable {
     private var writeGenerationStorage: UInt64 = 0
 
     /// 当前写代次。Thread-safe.
-    var writeGeneration: UInt64 {
+    public var writeGeneration: UInt64 {
         lock.lock()
         defer { lock.unlock() }
         return writeGenerationStorage
@@ -174,7 +174,7 @@ public final class Framebuffer: @unchecked Sendable {
     /// lock. ZRLE consists of hundreds or thousands of 64×64 tiles; exposing a
     /// scoped buffer avoids acquiring the lock once per tile (or once per
     /// palette row) while keeping the raw storage private and thread-safe.
-    func withUnsafeMutablePixelBytes<Result>(
+    public func withUnsafeMutablePixelBytes<Result>(
         _ body: (
             UnsafeMutableRawPointer,
             Int,

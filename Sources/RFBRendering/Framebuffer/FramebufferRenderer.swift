@@ -49,7 +49,7 @@ public final class FramebufferRenderer: @unchecked Sendable {
     private var zlibDecoder: ZlibEncodingRenderer
     private var zrleDecoder: ZRLEEncodingRenderer
     private var tightDecoder: TightEncodingRenderer
-    private var appleDCTDecoder: AppleAdaptiveDCTDecoder
+    private let appleDCTDecoder: any AppleDCTDecoding
     private var appleCursorCache: [UInt32: RemoteCursor] = [:]
 
     public init(framebuffer: Framebuffer, pixelFormat: PixelFormat) {
@@ -59,7 +59,7 @@ public final class FramebufferRenderer: @unchecked Sendable {
         self.zlibDecoder = ZlibEncodingRenderer()
         self.zrleDecoder = ZRLEEncodingRenderer()
         self.tightDecoder = TightEncodingRenderer()
-        self.appleDCTDecoder = AppleAdaptiveDCTDecoder()
+        self.appleDCTDecoder = AppleDCTDecoderRegistry.makeDecoder()
     }
 
     /// Apply a rectangle update to the framebuffer.
@@ -87,7 +87,8 @@ public final class FramebufferRenderer: @unchecked Sendable {
                 to: framebuffer, pixelFormat: pixelFormat
             )
         case .appleMultiVariantScreenshare:
-            try appleDCTDecoder.render(rect: rect, payload: data, to: framebuffer)
+            try appleDCTDecoder.render(
+                rect: rect, payload: data, to: framebuffer, drawPixels: true)
         default:
             throw RenderingError.unsupportedEncoding(rect.encoding)
         }
