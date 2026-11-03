@@ -1174,6 +1174,178 @@ final class VNCConfigurationTransportTests: XCTestCase {
         XCTAssertFalse(session.hasPublishedFramebufferImage)
     }
 
+    /// Mac 静止时也在重发相同内容：屏幕已经是对的，GPU 和整帧图都不该再动。
+    @MainActor
+    func testUnchangedDCTBatchesSkipPresentAndImage() async throws {
+        guard let presenter = FramebufferMetalPresenter() else {
+            throw XCTSkip("没有可用的 Metal 设备")
+        }
+        let connection = SuccessfulRFBConnection(
+            name: "metal-unchanged",
+            width: 8,
+            height: 8,
+            recordsFramebufferUpdateRequests: true)
+        var configuration = VNCConfiguration(
+            videoQualityMode: .standard,
+            reconnectionPolicy: VNCReconnectionPolicy(isEnabled: false, maximumAttempts: 0))
+        configuration.targetFrameRate = 120
+        configuration.transportProvider = { _, _ in connection }
+        let session = VNCSession(configuration: configuration)
+        try await session.connect(credentials: VNCCredentials(
+            host: "metal.test", port: 5900, password: ""))
+        var completed = await waitUntil { session.connectionState.isConnected }
+        XCTAssertTrue(completed)
+
+        func send(_ update: Data) async throws {
+            let requests = await connection.framebufferUpdateRequestCount()
+            await connection.enqueueServerBytes(update)
+            let answered = await waitForFramebufferRequest(after: requests, on: connection)
+            XCTAssertTrue(answered)
+        }
+
+        let white = Self.dctFramebufferUpdate(width: 8, height: 8, command: 0)
+        let black = Self.dctFramebufferUpdate(width: 8, height: 8, command: 3)
+        try await send(white)
+        completed = await waitUntil { session.currentImage != nil }
+        XCTAssertTrue(completed)
+        session.attachFramebufferPresenter(presenter)
+        // 挂上之前的改动可能还差一次呈现，等它落定。
+        try await send(white)
+        try await Task.sleep(for: .milliseconds(650))
+        let settledPresents = presenter.presentRequestCount
+        let settledImage = try XCTUnwrap(session.currentImage)
+
+        for _ in 0..<4 { try await send(white) }
+        try await Task.sleep(for: .milliseconds(650))
+        XCTAssertEqual(presenter.presentRequestCount, settledPresents, "内容没变不该再画")
+        XCTAssertTrue(session.currentImage === settledImage, "内容没变不该再拷整帧图")
+
+        // 变了要马上恢复，尾帧也要落到图上。
+        try await send(black)
+        completed = await waitUntil { presenter.presentRequestCount > settledPresents }
+        XCTAssertTrue(completed, "内容变了必须画")
+        completed = await waitUntil { session.currentImage !== settledImage }
+        XCTAssertTrue(completed, "内容变了必须更新图片")
+        XCTAssertEqual(Self.firstByte(of: session.currentImage), 0)
+
+        session.detachFramebufferPresenter(presenter)
+        session.disconnect()
+    }
+
+    /// 被节奏挡掉的改动不能因为后面的批次「没变」就丢了。
+    @MainActor
+    func testPendingChangeSurvivesFollowingUnchangedBatch() async throws {
+        guard let presenter = FramebufferMetalPresenter() else {
+            throw XCTSkip("没有可用的 Metal 设备")
+        }
+        let connection = SuccessfulRFBConnection(
+            name: "metal-pending",
+            width: 8,
+            height: 8,
+            recordsFramebufferUpdateRequests: true)
+        var configuration = VNCConfiguration(
+            videoQualityMode: .standard,
+            reconnectionPolicy: VNCReconnectionPolicy(isEnabled: false, maximumAttempts: 0))
+        // 帧间隔很长，第二批一定赶不上节奏。
+        configuration.targetFrameRate = 2
+        configuration.transportProvider = { _, _ in connection }
+        let session = VNCSession(configuration: configuration)
+        try await session.connect(credentials: VNCCredentials(
+            host: "metal.test", port: 5900, password: ""))
+        var completed = await waitUntil { session.connectionState.isConnected }
+        XCTAssertTrue(completed)
+
+        let white = Self.dctFramebufferUpdate(width: 8, height: 8, command: 0)
+        let black = Self.dctFramebufferUpdate(width: 8, height: 8, command: 3)
+        await connection.enqueueServerBytes(white)
+        completed = await waitUntil { session.currentImage != nil }
+        XCTAssertTrue(completed)
+        session.attachFramebufferPresenter(presenter)
+        try await Task.sleep(for: .milliseconds(600))
+        let before = presenter.presentRequestCount
+
+        await connection.enqueueServerBytes(black)
+        await connection.enqueueServerBytes(black)
+        await connection.enqueueServerBytes(black)
+        completed = await waitUntil { Self.firstByte(of: session.currentImage) == 0 }
+        XCTAssertTrue(completed, "改动丢了：图片没有更新")
+        completed = await waitUntil { presenter.presentRequestCount > before }
+        XCTAssertTrue(completed, "改动丢了：没有呈现")
+
+        session.detachFramebufferPresenter(presenter)
+        session.disconnect()
+    }
+
+    /// 一串更新的最后一批赶不上节奏：屏幕要按帧节奏补上，不能等 500ms 一次的整帧图；
+    /// 整帧图也要最终跟上。
+    @MainActor
+    func testBurstTailIsPresentedOnFrameCadenceAndReachesImage() async throws {
+        guard let presenter = FramebufferMetalPresenter() else {
+            throw XCTSkip("没有可用的 Metal 设备")
+        }
+        let connection = SuccessfulRFBConnection(
+            name: "metal-burst",
+            width: 8,
+            height: 8,
+            recordsFramebufferUpdateRequests: true)
+        var configuration = VNCConfiguration(
+            videoQualityMode: .standard,
+            reconnectionPolicy: VNCReconnectionPolicy(isEnabled: false, maximumAttempts: 0))
+        // 帧间隔 100ms：两批连着到，第二批一定不到期；尾帧远早于 500ms 的整帧图。
+        configuration.targetFrameRate = 10
+        configuration.transportProvider = { _, _ in connection }
+        let session = VNCSession(configuration: configuration)
+        try await session.connect(credentials: VNCCredentials(
+            host: "metal.test", port: 5900, password: ""))
+        var completed = await waitUntil { session.connectionState.isConnected }
+        XCTAssertTrue(completed)
+
+        let white = Self.dctFramebufferUpdate(width: 8, height: 8, command: 0)
+        let black = Self.dctFramebufferUpdate(width: 8, height: 8, command: 3)
+        await connection.enqueueServerBytes(white)
+        completed = await waitUntil { session.currentImage != nil }
+        XCTAssertTrue(completed)
+        session.attachFramebufferPresenter(presenter)
+        try await Task.sleep(for: .milliseconds(700))
+        let before = presenter.presentRequestCount
+
+        await connection.enqueueServerBytes(black + white)
+        completed = await waitUntil { presenter.presentRequestCount >= before + 2 }
+        XCTAssertTrue(completed, "最后一批没有呈现")
+        XCTAssertEqual(
+            Self.firstByte(of: session.currentImage), 0,
+            "屏幕要先于整帧图更新，否则最后一批等到了 500ms 的整帧图才画")
+
+        completed = await waitUntil { Self.firstByte(of: session.currentImage) == 255 }
+        XCTAssertTrue(completed, "最后一批没有落到图片上")
+
+        session.detachFramebufferPresenter(presenter)
+        session.disconnect()
+    }
+
+    /// 一块 8×8 的 DCT 更新。命令 0 是白块，命令 3 且掩码全 0 是黑块。
+    private static func dctFramebufferUpdate(width: UInt16, height: UInt16, command: Int) -> Data {
+        var update = Data([0, 0, 0, 1])
+        update.append(rectangleHeader(
+            x: 0, y: 0, width: width, height: height,
+            encoding: Encoding.appleMultiVariantScreenshare.rawValue))
+        // 保留位 0 + 3 位命令 + 游程位 0（一块）。
+        let commandByte = UInt8(command << 4)
+        var body: [UInt8] = [0, 15, 25, 0, 0, 7, commandByte]
+        if command == 3 {
+            body += [0] + [UInt8](repeating: 0, count: 8)
+        } else {
+            body += [0]
+        }
+        let count = body.count
+        update.append(contentsOf: [
+            UInt8((count >> 24) & 255), UInt8((count >> 16) & 255),
+            UInt8((count >> 8) & 255), UInt8(count & 255),
+        ])
+        update.append(contentsOf: body)
+        return update
+    }
+
     /// 登录投递靠 `currentImage` 判断画面变化，打开实时发布后不能再晚 500ms。
     @MainActor
     func testLiveImagePublishingKeepsCurrentImageFreshWithPresenter() async throws {

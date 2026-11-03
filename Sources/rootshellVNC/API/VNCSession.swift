@@ -1180,6 +1180,10 @@ public final class VNCSession {
     /// 一批画面没赶上节奏时，由它在节奏点补上，保证最后的状态上屏。
     @ObservationIgnored
     private var trailingFramePresentTask: Task<Void, Never>?
+    /// 帧缓冲里有还没画到屏幕上的改动。内容没变的批次靠它判断能不能跳过 GPU。
+    private var framebufferHasUnpresentedPixels = true
+    /// 帧缓冲里有还没进 `currentImage` 的改动。
+    private var framebufferHasUnpublishedPixels = true
     /// 挂了呈现器后整帧图的发布间隔。每张都是一次整屏内存拷贝，所以尽量低；
     /// 读者（缩略图、登录识别）只需要最近的大致画面。
     private static let presentedImagePublishIntervalNanos: UInt64 = 500_000_000
@@ -2752,16 +2756,24 @@ public final class VNCSession {
             && renderStarted &- lastFramePresentNanos >= frameInterval
             ? presenter : nil
         let presentedFramebuffer = framebuffer
-        let result = await withCheckedContinuation { continuation in
+        let presentsUnchanged = framebufferHasUnpresentedPixels
+        let snapshotsUnchanged = framebufferHasUnpublishedPixels
+        let (result, didPresent) = await withCheckedContinuation {
+            (continuation: CheckedContinuation<(FramebufferRenderBatchResult, Bool), Never>) in
             framebufferRenderQueue.async {
                 let result = renderer.applyBatch(
                     renderRects,
-                    snapshot: takeSnapshot)
+                    snapshot: takeSnapshot,
+                    snapshotUnchanged: snapshotsUnchanged)
                 // 在解码队列上画并等 GPU 读完：下一批写入不会混进这一帧。
-                if let framePresenter, let presentedFramebuffer {
+                // Mac 静止时也在不停重发相同内容，这时屏幕已经是对的，不用让 GPU 白画一遍。
+                var didPresent = false
+                if let framePresenter, let presentedFramebuffer,
+                   result.pixelsChanged || presentsUnchanged {
                     framePresenter.presentFrame(from: presentedFramebuffer)
+                    didPresent = true
                 }
-                continuation.resume(returning: result)
+                continuation.resume(returning: (result, didPresent))
             }
         }
         // The old renderer must finish its serial codec work, but a transport
@@ -2772,12 +2784,17 @@ public final class VNCSession {
         if carriesFramebufferPixels && initialFramePresentationAllowed {
             standardFramebufferHasPresentablePixels = true
         }
+        if result.pixelsChanged {
+            framebufferHasUnpresentedPixels = true
+            framebufferHasUnpublishedPixels = true
+        }
         let renderFinished = DispatchTime.now().uptimeNanoseconds
-        if framePresenter != nil {
+        if didPresent {
             trailingFramePresentTask?.cancel()
             trailingFramePresentTask = nil
             lastFramePresentNanos = renderFinished
-        } else if framePresentable, presenter != nil {
+            framebufferHasUnpresentedPixels = false
+        } else if framePresentable, presenter != nil, framebufferHasUnpresentedPixels {
             scheduleTrailingFramePresent(interval: frameInterval)
         }
         let renderMilliseconds = (renderFinished &- renderStarted) / 1_000_000
@@ -2813,6 +2830,7 @@ public final class VNCSession {
             trailingSnapshotTask = nil
             currentImage = image
             lastImagePublishNanos = DispatchTime.now().uptimeNanoseconds
+            framebufferHasUnpublishedPixels = false
             considerAppleLoginVisionFrame(
                 .image(image),
                 source: "Standard framebuffer snapshot")
@@ -2821,7 +2839,11 @@ public final class VNCSession {
             // Control-only DCT type 2 carries quantization tables, not pixels.
             // It must never publish the newly allocated black framebuffer or
             // anchor an image timer before the first image arrives.
-            scheduleTrailingSnapshot(interval: publishInterval)
+            if framebufferHasUnpublishedPixels || displaySuspended {
+                scheduleTrailingSnapshot(interval: publishInterval)
+            } else {
+                retryAppleLoginVisionOnUnchangedFrame()
+            }
         }
         switch result.cursorUpdate {
         case .shape(let cursor):
@@ -3705,6 +3727,14 @@ public final class VNCSession {
         considerAppleLoginVisionFrame(.image(image), source: source)
     }
 
+    /// 画面没变就不再出新图，但 OCR 可能上一次被最小间隔挡住了。
+    /// 不补这一下，静止的登录界面可能永远等不到识别。
+    private func retryAppleLoginVisionOnUnchangedFrame() {
+        guard configuration.promptForLoginPasswordAtLoginWindow,
+              canSendLoginPassword else { return }
+        driveAppleLoginVisionFromLatestCandidate()
+    }
+
     private func driveAppleLoginVisionFromLatestCandidate() {
         guard appleServerProtocolObserved,
               let latest = appleLoginVisionLatestFrame else { return }
@@ -4403,6 +4433,7 @@ public final class VNCSession {
                   !self.suspendsDisplayPresentation,
                   !VNCPresentationPolicy.isPresentationProhibited() else { return }
             self.lastFramePresentNanos = DispatchTime.now().uptimeNanoseconds
+            self.framebufferHasUnpresentedPixels = false
             let queue = self.framebufferRenderQueue
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                 queue.async {
@@ -4468,9 +4499,13 @@ public final class VNCSession {
             if let image {
                 self.currentImage = image
                 self.lastImagePublishNanos = DispatchTime.now().uptimeNanoseconds
+                self.framebufferHasUnpublishedPixels = false
                 self.considerAppleLoginVisionFrame(
                     .image(image),
                     source: "Standard trailing snapshot")
+            }
+            if reconcilePresenter != nil {
+                self.framebufferHasUnpresentedPixels = false
             }
             self.trailingSnapshotTask = nil
         }
@@ -4487,6 +4522,8 @@ public final class VNCSession {
         trailingFramePresentTask = nil
         initialFramePresentationTracker.reset()
         standardFramebufferHasPresentablePixels = false
+        framebufferHasUnpresentedPixels = true
+        framebufferHasUnpublishedPixels = true
         lastImagePublishNanos = 0
         lastFramePresentNanos = 0
         deferredFramebufferRects.removeAll(keepingCapacity: true)

@@ -160,6 +160,16 @@ public final class Framebuffer: @unchecked Sendable {
 
     // MARK: - Write operations
 
+    /// 任何写入都会递增。解码器靠它发现别人写过帧缓冲；新增写入口忘了处理也只会多画，不会漏画。
+    private var writeGenerationStorage: UInt64 = 0
+
+    /// 当前写代次。Thread-safe.
+    var writeGeneration: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return writeGenerationStorage
+    }
+
     /// Perform one compound render operation while holding the framebuffer
     /// lock. ZRLE consists of hundreds or thousands of 64×64 tiles; exposing a
     /// scoped buffer avoids acquiring the lock once per tile (or once per
@@ -175,6 +185,7 @@ public final class Framebuffer: @unchecked Sendable {
     ) rethrows -> Result {
         lock.lock()
         defer { lock.unlock() }
+        writeGenerationStorage &+= 1
         storage.beginAccess(readOnly: false)
         defer { storage.endAccess(readOnly: false) }
         return try body(pixelData, width, height, bytesPerRow, bytesPerPixel)
@@ -186,6 +197,7 @@ public final class Framebuffer: @unchecked Sendable {
 
         lock.lock()
         defer { lock.unlock() }
+        writeGenerationStorage &+= 1
         storage.beginAccess(readOnly: false)
         defer { storage.endAccess(readOnly: false) }
 
@@ -219,6 +231,7 @@ public final class Framebuffer: @unchecked Sendable {
 
         lock.lock()
         defer { lock.unlock() }
+        writeGenerationStorage &+= 1
         storage.beginAccess(readOnly: false)
         defer { storage.endAccess(readOnly: false) }
 
@@ -267,6 +280,7 @@ public final class Framebuffer: @unchecked Sendable {
 
         lock.lock()
         defer { lock.unlock() }
+        writeGenerationStorage &+= 1
         storage.beginAccess(readOnly: false)
         defer { storage.endAccess(readOnly: false) }
 
@@ -401,6 +415,7 @@ public final class Framebuffer: @unchecked Sendable {
 
         guard newWidth != width || newHeight != height else { return }
 
+        writeGenerationStorage &+= 1
         let newStorage = FramebufferStorage(
             width: newWidth, height: newHeight, bytesPerPixel: bytesPerPixel)
         let newBytesPerRow = newStorage.bytesPerRow

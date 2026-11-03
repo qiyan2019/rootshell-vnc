@@ -34,6 +34,8 @@ public struct FramebufferRenderBatchResult: @unchecked Sendable {
     /// Non-nil only when this update carried a Cursor pseudo-encoding rect.
     public let cursorUpdate: RemoteCursorUpdate?
     public let issues: [String]
+    /// 这批更新有没有改过帧缓冲。只有自适应 DCT 能判断出「没变」，其他编码一律按变了算。
+    public let pixelsChanged: Bool
 }
 
 // MARK: - FramebufferRenderer
@@ -98,10 +100,14 @@ public final class FramebufferRenderer: @unchecked Sendable {
     /// Pass `snapshot: false` to apply rects without paying for the
     /// full-framebuffer image copy — the result's `image` is nil and the
     /// caller publishes a later snapshot instead.
+    /// - Parameter snapshotUnchanged: 内容没变时要不要也出一张图。调用方手里那张图已经是
+    ///   最新的就传 false，省一次整帧拷贝。
     public func applyBatch(
         _ rects: [(FramebufferRect, Data)],
-        snapshot takeSnapshot: Bool = true
+        snapshot takeSnapshot: Bool = true,
+        snapshotUnchanged: Bool = true
     ) -> FramebufferRenderBatchResult {
+        var pixelsChanged = false
         var resizedWidth: UInt16?
         var resizedHeight: UInt16?
         var cursorUpdate: RemoteCursorUpdate?
@@ -119,10 +125,12 @@ public final class FramebufferRenderer: @unchecked Sendable {
                 let srcY = UInt16(data[data.startIndex + 2]) << 8
                     | UInt16(data[data.startIndex + 3])
                 applyCopyRect(rect: rect, srcX: srcX, srcY: srcY)
+                pixelsChanged = true
 
             case .desktopSize, .extendedDesktopSize:
                 guard rect.isSuccessfulDesktopResize else { continue }
                 handleDesktopResize(width: rect.width, height: rect.height)
+                pixelsChanged = true
                 resizedWidth = rect.width
                 resizedHeight = rect.height
 
@@ -167,15 +175,21 @@ public final class FramebufferRenderer: @unchecked Sendable {
                         "Failed to apply rect (\(rect.encoding)): "
                             + error.localizedDescription)
                 }
+                if rect.encoding == .appleMultiVariantScreenshare {
+                    if appleDCTDecoder.takeDidWritePixels() { pixelsChanged = true }
+                } else {
+                    pixelsChanged = true
+                }
             }
         }
 
         return FramebufferRenderBatchResult(
-            image: takeSnapshot ? snapshot() : nil,
+            image: takeSnapshot && (pixelsChanged || snapshotUnchanged) ? snapshot() : nil,
             resizedWidth: resizedWidth,
             resizedHeight: resizedHeight,
             cursorUpdate: cursorUpdate,
-            issues: issues)
+            issues: issues,
+            pixelsChanged: pixelsChanged)
     }
 
     /// Apply a CopyRect (data contains srcX, srcY as 2 UInt16s).
