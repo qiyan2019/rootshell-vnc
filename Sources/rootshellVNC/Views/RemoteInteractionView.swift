@@ -189,7 +189,7 @@ final class RemoteInputUIView: UIView, UIKeyInput, UIGestureRecognizerDelegate,
     private var momentumDisplayLink: CADisplayLink?
     /// 触摸滚动调参：直接触摸路径的缩放补偿 / 速度增益 / 惯性 / 叠加。
     private var scrollTuning = RemoteScrollTuning()
-    /// 帧缓冲像素 / 远端 point（Apple 虚拟显示器恒为 2，其余为 1）。
+    /// 帧缓冲像素 / 远端 point（走 0x17 精确滚动的连接为 2，否则为 1）。
     private var remotePixelsPerPoint: CGFloat = 1
     /// 连续甩叠加：接住惯性时记录剩余屏幕速度，下一次抬手并入初速。
     private var flickStacker = FlickStacker()

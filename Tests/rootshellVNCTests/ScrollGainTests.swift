@@ -292,15 +292,17 @@ final class ScrollGainTests: XCTestCase {
     // MARK: - P（帧缓冲像素 / 远端 point）解析
 
     func testRemotePixelsPerPointResolution() {
+        // 规则：宿主覆盖 > 走 0x17 精确滚动 → 2 > 否则 1。
+        // Match Client 也走 0x17，自然落在 2，不单列。
         XCTAssertEqual(
             ScrollGain.resolvedRemotePixelsPerPoint(
-                override: 3, isAppleVirtualDisplay: true), 3)
+                override: 3, usesApplePreciseScroll: true), 3)
         XCTAssertEqual(
             ScrollGain.resolvedRemotePixelsPerPoint(
-                override: nil, isAppleVirtualDisplay: true), 2)
+                override: nil, usesApplePreciseScroll: true), 2)
         XCTAssertEqual(
             ScrollGain.resolvedRemotePixelsPerPoint(
-                override: nil, isAppleVirtualDisplay: false), 1)
+                override: nil, usesApplePreciseScroll: false), 1)
     }
 
     // MARK: - 接线顺序（屏幕增量 → 过滤 → 增益 → 取整）

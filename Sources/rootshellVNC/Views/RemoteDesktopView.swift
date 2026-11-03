@@ -480,8 +480,7 @@ public struct RemoteDesktopView: View {
             scrollTuning: scrollTuning,
             remotePixelsPerPoint: ScrollGain.resolvedRemotePixelsPerPoint(
                 override: scrollTuning.remotePixelsPerPoint,
-                isAppleVirtualDisplay: session.configuration
-                    .displaySizingMode == .matchClient))
+                usesApplePreciseScroll: session.usesApplePreciseScroll))
             .frame(width: viewSize.width, height: viewSize.height)
             .contentShape(Rectangle())
         #else

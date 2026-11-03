@@ -856,6 +856,20 @@ public final class VNCSession {
     /// media generation.
     public private(set) var activeVideoDisplayCount: Int = 1
 
+    /// Whether this connection delivers scroll as Apple precise events
+    /// (0x17, pointDelta in macOS points) rather than wheel-button clicks.
+    /// Same predicate as `TransportSession.shouldUseApplePreciseInput`
+    /// (Sources/RFBTransport/Session/TransportSession.swift:1129-1136) —
+    /// an internal static there, so the condition is duplicated here:
+    /// capabilities advertise the precise-scroll command OR the negotiated
+    /// version is Apple. False before ServerInit and on conventional
+    /// RFB servers.
+    public var usesApplePreciseScroll: Bool {
+        serverCapabilities?.supportsServerCommand(
+            AppleServerCapabilities.preciseScrollCommand) == true
+            || diagnostics.clientVersion?.isApple == true
+    }
+
     /// Server display rectangles, normalized into framebuffer coordinates and
     /// ordered as announced by the server (primary first). Standard mode uses
     /// these to present only the number of displays selected by the user.

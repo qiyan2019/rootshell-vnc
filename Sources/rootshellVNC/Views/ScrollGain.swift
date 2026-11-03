@@ -147,12 +147,17 @@ public enum ScrollGain {
         return CGPoint(x: velocity.x * decay, y: velocity.y * decay)
     }
 
-    /// 解析 P：宿主覆盖 > Apple 虚拟显示器（Match Client 恒为 2×）> 1。
+    /// 解析 P：宿主覆盖 > 本连接走 Apple 精确滚动（0x17）时为 2 > 否则 1。
+    /// 0x17 的 pointDelta 是 macOS point，这类连接的帧缓冲通常按
+    /// Retina 2× 上报；非 HiDPI 外接屏 1:1 时增益会大一倍，用覆盖修正。
+    /// `usesApplePreciseScroll` 必须来自
+    /// `VNCSession.usesApplePreciseScroll`（与
+    /// `TransportSession.shouldUseApplePreciseInput` 同一谓词）。
     public static func resolvedRemotePixelsPerPoint(
         override: CGFloat?,
-        isAppleVirtualDisplay: Bool
+        usesApplePreciseScroll: Bool
     ) -> CGFloat {
-        override ?? (isAppleVirtualDisplay ? 2 : 1)
+        override ?? (usesApplePreciseScroll ? 2 : 1)
     }
 }
 
