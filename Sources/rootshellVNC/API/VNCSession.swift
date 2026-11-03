@@ -997,6 +997,8 @@ public final class VNCSession {
             secondaryVideoBandRenderer.setPresentationSuspended(suspendsDisplayPresentation)
             framebufferPresenter?.setPresentationAllowed(!suspendsDisplayPresentation)
             if !suspendsDisplayPresentation, renderer != nil {
+                // 全局禁绘期间图层内容可能失效；视图补帧在全局门还开着时不执行，静止画面又没有新数据，恢复时总是补一帧。
+                framebufferHasUnpresentedPixels = true
                 scheduleTrailingSnapshot(interval: 0)
             }
         }
@@ -1014,6 +1016,8 @@ public final class VNCSession {
         videoBandRenderer.presentPendingBandsIfAny()
         secondaryVideoBandRenderer.presentPendingBandsIfAny()
         if renderer != nil, trailingSnapshotTask == nil {
+            // 全局禁绘期间图层内容可能失效；视图补帧在全局门还开着时不执行，静止画面又没有新数据，恢复时总是补一帧。
+            framebufferHasUnpresentedPixels = true
             scheduleTrailingSnapshot(interval: 0)
         }
     }
@@ -1875,6 +1879,7 @@ public final class VNCSession {
     ///   - downFlag: `true` for key press, `false` for key release.
     ///   - key: The X11 keysym value for the key.
     public func sendKeyEvent(downFlag: Bool, key: UInt32) {
+        noteUserInteraction()
         guard !isViewOnly else { return }
         guard connectionState.isConnected, transportSession != nil else { return }
         heldInput.noteKey(down: downFlag, keysym: key)
@@ -1899,6 +1904,7 @@ public final class VNCSession {
     ///   - x: The X coordinate in framebuffer pixels.
     ///   - y: The Y coordinate in framebuffer pixels.
     public func sendPointerEvent(buttonMask: UInt8, x: UInt16, y: UInt16) {
+        noteUserInteraction()
         guard !isViewOnly else { return }
         guard connectionState.isConnected, transportSession != nil else { return }
         heldInput.notePointer(buttonMask: buttonMask, x: x, y: y)
@@ -1935,6 +1941,7 @@ public final class VNCSession {
     /// scrolling receive the full event; all other servers receive ordinary
     /// RFB wheel-button press/release events from the transport fallback.
     public func sendScrollEvent(_ event: AppleScrollEvent) {
+        noteUserInteraction()
         guard !isViewOnly else { return }
         guard connectionState.isConnected, transportSession != nil else { return }
 
@@ -2766,8 +2773,14 @@ public final class VNCSession {
         let framePresentable = carriesFramebufferPixels
             && initialFramePresentationAllowed
             && !displaySuspended
+        // 只有呈现这一路按操作降载；图片发布节奏（publishInterval）不变。
+        let presentInterval = Self.presentationIntervalNanos(
+            frameInterval: frameInterval,
+            lastUserInteractionNanos: lastUserInteractionNanos,
+            now: renderStarted,
+            passivePresentationFrameRate: configuration.passivePresentationFrameRate)
         let framePresenter = framePresentable
-            && renderStarted &- lastFramePresentNanos >= frameInterval
+            && renderStarted &- lastFramePresentNanos >= presentInterval
             ? presenter : nil
         let presentedFramebuffer = framebuffer
         let presentsUnchanged = framebufferHasUnpresentedPixels
@@ -2809,7 +2822,7 @@ public final class VNCSession {
             lastFramePresentNanos = renderFinished
             framebufferHasUnpresentedPixels = false
         } else if framePresentable, presenter != nil, framebufferHasUnpresentedPixels {
-            scheduleTrailingFramePresent(interval: frameInterval)
+            scheduleTrailingFramePresent(interval: presentInterval)
         }
         let renderMilliseconds = (renderFinished &- renderStarted) / 1_000_000
         if renderMilliseconds >= 100,
@@ -2853,11 +2866,13 @@ public final class VNCSession {
             // Control-only DCT type 2 carries quantization tables, not pixels.
             // It must never publish the newly allocated black framebuffer or
             // anchor an image timer before the first image arrives.
-            if framebufferHasUnpublishedPixels || displaySuspended {
+            if framebufferHasUnpublishedPixels, !displaySuspended {
                 scheduleTrailingSnapshot(interval: publishInterval)
-            } else {
+            } else if !displaySuspended {
                 retryAppleLoginVisionOnUnchangedFrame()
             }
+            // 挂起时不排尾帧：恢复由 suspendsDisplayPresentation 的 didSet /
+            // reconcileDisplayPresentation 用 interval: 0 补帧。
         }
         switch result.cursorUpdate {
         case .shape(let cursor):
@@ -4414,9 +4429,41 @@ public final class VNCSession {
         UInt64(1_000_000_000 / max(1, configuration.targetFrameRate))
     }
 
+    /// 上次用户操作的时间（uptime）。发出去的键、指针、滚动事件都算，登录
+    /// 投递和 held-input 释放这些内部入口也都走这三个函数，一并记上。
+    @ObservationIgnored
+    private var lastUserInteractionNanos: UInt64?
+
+    /// 记一次用户操作。有操作的一秒内呈现保持 `targetFrameRate` 满帧。
+    private func noteUserInteraction() {
+        lastUserInteractionNanos = DispatchTime.now().uptimeNanoseconds
+    }
+
+    /// 呈现间隔：`passivePresentationFrameRate` 没配时行为和以前完全一样；
+    /// 配了的话，距上次操作不到一秒用满帧间隔，否则按被动帧率封顶。
+    nonisolated static func presentationIntervalNanos(
+        frameInterval: UInt64,
+        lastUserInteractionNanos: UInt64?,
+        now: UInt64,
+        passivePresentationFrameRate: Int?
+    ) -> UInt64 {
+        guard let passivePresentationFrameRate else { return frameInterval }
+        let passiveInterval = 1_000_000_000 / UInt64(max(1, passivePresentationFrameRate))
+        if let lastUserInteractionNanos,
+           now &- lastUserInteractionNanos < 1_000_000_000 {
+            return frameInterval
+        }
+        return max(frameInterval, passiveInterval)
+    }
+
     /// 实际提交给 GPU 的帧数（性能基准用）。
     public var framebufferFramesPresented: Int {
         framebufferPresenter?.framesPresentedCount ?? 0
+    }
+
+    /// 整帧图创建次数（测试用）：这是最贵的 CPU 拷贝，挂起时一次都不该发生。
+    var framebufferImageCreationCount: Int {
+        framebuffer?.imageCreationCount ?? 0
     }
 
     /// 这一连接能否走 GPU 呈现。16 位千色和超过纹理上限的桌面继续走图片路径。
@@ -4445,7 +4492,9 @@ public final class VNCSession {
                   self.framebufferPresenter === presenter,
                   !self.initialFramePresentationTracker.suppressesPresentation,
                   !self.suspendsDisplayPresentation,
-                  !VNCPresentationPolicy.isPresentationProhibited() else { return }
+                  !VNCPresentationPolicy.isPresentationProhibited(),
+                  // 等待期间正常路径已经画过：内容没变，不重复绘制。
+                  self.framebufferHasUnpresentedPixels else { return }
             self.lastFramePresentNanos = DispatchTime.now().uptimeNanoseconds
             self.framebufferHasUnpresentedPixels = false
             let queue = self.framebufferRenderQueue
@@ -4481,13 +4530,22 @@ public final class VNCSession {
             let queue = self.framebufferRenderQueue
             // 恢复呈现时（`suspendsDisplayPresentation` 清除）也走这里：解码一直在写内存，
             // 挂起期间屏幕没更新，这里补上一帧。
-            let reconcilePresenter = self.suspendsDisplayPresentation
-                || VNCPresentationPolicy.isPresentationProhibited()
-                ? nil : self.framebufferPresenter
+            // 挂起或全局禁绘时不整帧拷贝：直接结束任务，保留
+            // framebufferHasUnpublishedPixels，恢复路径（didSet 清除 /
+            // reconcileDisplayPresentation）会用 interval: 0 补帧。
+            guard !self.suspendsDisplayPresentation,
+                  !VNCPresentationPolicy.isPresentationProhibited() else {
+                self.trailingSnapshotTask = nil
+                return
+            }
+            let reconcilePresenter = self.framebufferPresenter
             let reconcileFramebuffer = self.framebuffer
+            // 标志为假说明屏幕已经是最新的，不重复绘制；挂起期间有改动时它为真。
+            let presentsUnpresented = self.framebufferHasUnpresentedPixels
             let image = await withCheckedContinuation { continuation in
                 queue.async {
-                    if let reconcilePresenter, let reconcileFramebuffer {
+                    if let reconcilePresenter, let reconcileFramebuffer,
+                       presentsUnpresented {
                         reconcilePresenter.presentFrame(from: reconcileFramebuffer)
                     }
                     continuation.resume(returning: renderer.snapshot())
@@ -4518,7 +4576,7 @@ public final class VNCSession {
                     .image(image),
                     source: "Standard trailing snapshot")
             }
-            if reconcilePresenter != nil {
+            if reconcilePresenter != nil, presentsUnpresented {
                 self.framebufferHasUnpresentedPixels = false
             }
             self.trailingSnapshotTask = nil

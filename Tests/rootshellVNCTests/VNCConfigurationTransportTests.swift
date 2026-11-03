@@ -1470,6 +1470,273 @@ final class VNCConfigurationTransportTests: XCTestCase {
         session.disconnect()
     }
 
+    /// 被动帧率的纯逻辑：没配不改变节奏；有操作的一秒内满帧；之后按被动帧率封顶；
+    /// 被动帧率比满帧还高时不能反过来加速。
+    func testPresentationIntervalHonorsPassiveRateAndRecentInteraction() {
+        let full: UInt64 = 1_000_000_000 / 120
+        let now: UInt64 = 100_000_000_000
+
+        XCTAssertEqual(
+            VNCSession.presentationIntervalNanos(
+                frameInterval: full,
+                lastUserInteractionNanos: now - 60_000_000_000,
+                now: now,
+                passivePresentationFrameRate: nil),
+            full, "没配被动帧率时行为不变")
+
+        XCTAssertEqual(
+            VNCSession.presentationIntervalNanos(
+                frameInterval: full,
+                lastUserInteractionNanos: nil,
+                now: now,
+                passivePresentationFrameRate: 2),
+            500_000_000, "从没操作过要按被动帧率")
+
+        XCTAssertEqual(
+            VNCSession.presentationIntervalNanos(
+                frameInterval: full,
+                lastUserInteractionNanos: now - 999_999_999,
+                now: now,
+                passivePresentationFrameRate: 2),
+            full, "操作后一秒内保持满帧")
+
+        XCTAssertEqual(
+            VNCSession.presentationIntervalNanos(
+                frameInterval: full,
+                lastUserInteractionNanos: now - 1_000_000_000,
+                now: now,
+                passivePresentationFrameRate: 2),
+            500_000_000, "操作满一秒后降载")
+
+        XCTAssertEqual(
+            VNCSession.presentationIntervalNanos(
+                frameInterval: full,
+                lastUserInteractionNanos: now - 60_000_000_000,
+                now: now,
+                passivePresentationFrameRate: 240),
+            full, "被动帧率更高时不能加速满帧")
+
+        XCTAssertEqual(
+            VNCSession.presentationIntervalNanos(
+                frameInterval: full,
+                lastUserInteractionNanos: now - 60_000_000_000,
+                now: now,
+                passivePresentationFrameRate: 0),
+            1_000_000_000, "被动帧率下限是 1")
+    }
+
+    /// 没人操作时呈现按被动帧率走：中间帧被节奏挡掉但最后一帧不丢；
+    /// 用户一动（发键/指针/滚动都算）立即恢复满帧。
+    @MainActor
+    func testPassiveRateThrottlesPresentationButInteractionRestores() async throws {
+        guard let presenter = FramebufferMetalPresenter() else {
+            throw XCTSkip("没有可用的 Metal 设备")
+        }
+        let connection = SuccessfulRFBConnection(
+            name: "metal-passive",
+            width: 8,
+            height: 8,
+            recordsFramebufferUpdateRequests: true)
+        var configuration = VNCConfiguration(
+            videoQualityMode: .standard,
+            reconnectionPolicy: VNCReconnectionPolicy(isEnabled: false, maximumAttempts: 0))
+        configuration.targetFrameRate = 120
+        // 被动帧率 1：没人操作时呈现间隔一秒，断言窗口留得足够宽。
+        configuration.passivePresentationFrameRate = 1
+        configuration.transportProvider = { _, _ in connection }
+        let session = VNCSession(configuration: configuration)
+        try await session.connect(credentials: VNCCredentials(
+            host: "metal.test", port: 5900, password: ""))
+        var completed = await waitUntil { session.connectionState.isConnected }
+        XCTAssertTrue(completed)
+
+        await connection.enqueueServerBytes(Self.rawFramebufferUpdate(
+            x: 0, y: 0, width: 8, height: 8, byte: 0x10))
+        completed = await waitUntil { session.currentImage != nil }
+        XCTAssertTrue(completed)
+        session.attachFramebufferPresenter(presenter)
+        try await Task.sleep(for: .milliseconds(600))
+        let settled = presenter.presentRequestCount
+
+        // 没人操作：第一批立即画，第二批被一秒的被动节奏挡掉。
+        await connection.enqueueServerBytes(Self.rawFramebufferUpdate(
+            x: 0, y: 0, width: 8, height: 8, byte: 0x20))
+        completed = await waitUntil { presenter.presentRequestCount > settled }
+        XCTAssertTrue(completed)
+        await connection.enqueueServerBytes(Self.rawFramebufferUpdate(
+            x: 0, y: 0, width: 8, height: 8, byte: 0x30))
+        try await Task.sleep(for: .milliseconds(400))
+        XCTAssertEqual(
+            presenter.presentRequestCount, settled + 1,
+            "没操作时隔秒才画，中间帧不能抢着画")
+        // 但最后一帧不能丢：被动节奏到期要补画。
+        completed = await waitUntil(timeout: .seconds(2)) {
+            presenter.presentRequestCount > settled + 1
+        }
+        XCTAssertTrue(completed, "被动节奏到期后最后一帧要补画")
+
+        // 用户一动立即恢复满帧：下一批不用等被动节奏。
+        session.sendPointerEvent(buttonMask: 0, x: 1, y: 1)
+        let restored = presenter.presentRequestCount
+        await connection.enqueueServerBytes(Self.rawFramebufferUpdate(
+            x: 0, y: 0, width: 8, height: 8, byte: 0x40))
+        completed = await waitUntil(timeout: .milliseconds(400)) {
+            presenter.presentRequestCount > restored
+        }
+        XCTAssertTrue(completed, "操作后要立刻恢复满帧呈现")
+
+        session.detachFramebufferPresenter(presenter)
+        session.disconnect()
+    }
+
+    /// 挂起期间一次整帧拷贝都不能有（这是最贵的 CPU 拷贝），尾帧任务也不排队；
+    /// 恢复时正好补一帧、发一次整帧图，不重复画。
+    @MainActor
+    func testSuspendedSessionSkipsSnapshotCopiesUntilResume() async throws {
+        guard let presenter = FramebufferMetalPresenter() else {
+            throw XCTSkip("没有可用的 Metal 设备")
+        }
+        let connection = SuccessfulRFBConnection(
+            name: "metal-suspend-copy",
+            width: 8,
+            height: 8,
+            recordsFramebufferUpdateRequests: true)
+        var configuration = VNCConfiguration(
+            videoQualityMode: .standard,
+            reconnectionPolicy: VNCReconnectionPolicy(isEnabled: false, maximumAttempts: 0))
+        configuration.targetFrameRate = 120
+        configuration.transportProvider = { _, _ in connection }
+        let session = VNCSession(configuration: configuration)
+        try await session.connect(credentials: VNCCredentials(
+            host: "metal.test", port: 5900, password: ""))
+        var completed = await waitUntil { session.connectionState.isConnected }
+        XCTAssertTrue(completed)
+
+        await connection.enqueueServerBytes(Self.rawFramebufferUpdate(
+            x: 0, y: 0, width: 8, height: 8, byte: 0x10))
+        completed = await waitUntil { session.currentImage != nil }
+        XCTAssertTrue(completed)
+        session.attachFramebufferPresenter(presenter)
+        try await Task.sleep(for: .milliseconds(600))
+        let settledCopies = session.framebufferImageCreationCount
+        let settledPresents = presenter.presentRequestCount
+
+        // 挂起期间来一批画面：解码照常走，但不画、不拷整帧图，500ms 尾帧也不排。
+        session.suspendsDisplayPresentation = true
+        let requests = await connection.framebufferUpdateRequestCount()
+        await connection.enqueueServerBytes(Self.rawFramebufferUpdate(
+            x: 0, y: 0, width: 8, height: 8, byte: 0x20))
+        completed = await waitForFramebufferRequest(after: requests, on: connection)
+        XCTAssertTrue(completed)
+        try await Task.sleep(for: .milliseconds(700))
+        XCTAssertEqual(
+            session.framebufferImageCreationCount, settledCopies,
+            "挂起期间一次整帧拷贝都不能发生")
+        XCTAssertEqual(
+            presenter.presentRequestCount, settledPresents,
+            "挂起期间不能画")
+        XCTAssertEqual(
+            Self.firstByte(of: session.currentImage), 0x10,
+            "挂起期间图片不能被覆盖")
+
+        // 恢复：补一帧呈现、一次整帧拷贝，画面落到新内容上。
+        session.suspendsDisplayPresentation = false
+        completed = await waitUntil {
+            Self.firstByte(of: session.currentImage) == 0x20
+        }
+        XCTAssertTrue(completed, "恢复后积压的画面要落到图片上")
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(
+            session.framebufferImageCreationCount, settledCopies + 1,
+            "恢复时整帧图只画一次")
+        XCTAssertEqual(
+            presenter.presentRequestCount, settledPresents + 1,
+            "恢复时只补一帧，不能重复画")
+
+        // 没新内容的第二次挂起+恢复：整帧图照发，并再补一帧。
+        session.suspendsDisplayPresentation = true
+        try await Task.sleep(for: .milliseconds(50))
+        session.suspendsDisplayPresentation = false
+        completed = await waitUntil {
+            session.framebufferImageCreationCount == settledCopies + 2
+        }
+        XCTAssertTrue(completed)
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(
+            presenter.presentRequestCount, settledPresents + 2,
+            "画面没变时恢复也要补一帧")
+
+        session.detachFramebufferPresenter(presenter)
+        session.disconnect()
+    }
+
+    /// 全局禁绘门（锁屏）拉起时连整帧拷贝都不做；宿主解除后调
+    /// `reconcileDisplayPresentation` 补一帧、发一次整帧图。
+    @MainActor
+    func testPresentationPolicyGateHoldsCopiesUntilReconcile() async throws {
+        guard let presenter = FramebufferMetalPresenter() else {
+            throw XCTSkip("没有可用的 Metal 设备")
+        }
+        VNCPresentationPolicy.isPresentationProhibited = { true }
+        defer { VNCPresentationPolicy.isPresentationProhibited = { false } }
+
+        let connection = SuccessfulRFBConnection(
+            name: "metal-policy",
+            width: 8,
+            height: 8,
+            recordsFramebufferUpdateRequests: true)
+        var configuration = VNCConfiguration(
+            videoQualityMode: .standard,
+            reconnectionPolicy: VNCReconnectionPolicy(isEnabled: false, maximumAttempts: 0))
+        configuration.targetFrameRate = 120
+        configuration.transportProvider = { _, _ in connection }
+        let session = VNCSession(configuration: configuration)
+        try await session.connect(credentials: VNCCredentials(
+            host: "metal.test", port: 5900, password: ""))
+        var completed = await waitUntil { session.connectionState.isConnected }
+        XCTAssertTrue(completed)
+        session.attachFramebufferPresenter(presenter)
+
+        // 门拉起时来一批：解码继续，但不画、不拷、不发图。
+        let requests = await connection.framebufferUpdateRequestCount()
+        await connection.enqueueServerBytes(Self.rawFramebufferUpdate(
+            x: 0, y: 0, width: 8, height: 8, byte: 0x10))
+        completed = await waitForFramebufferRequest(after: requests, on: connection)
+        XCTAssertTrue(completed)
+        try await Task.sleep(for: .milliseconds(700))
+        XCTAssertEqual(session.framebufferImageCreationCount, 0,
+                       "全局禁绘期间一次整帧拷贝都不能发生")
+        XCTAssertEqual(presenter.presentRequestCount, 0,
+                       "全局禁绘期间不能画")
+        XCTAssertNil(session.currentImage, "全局禁绘期间不发图")
+
+        // 宿主解除门并补一帧。
+        VNCPresentationPolicy.isPresentationProhibited = { false }
+        session.reconcileDisplayPresentation()
+        completed = await waitUntil { session.currentImage != nil }
+        XCTAssertTrue(completed, "解除后要发出积压的画面")
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(session.framebufferImageCreationCount, 1,
+                       "恢复时整帧图只画一次")
+        XCTAssertEqual(presenter.presentRequestCount, 1,
+                       "恢复时只补一帧")
+
+        // 没有新数据再 reconcile 一次：仍要补一帧。
+        session.reconcileDisplayPresentation()
+        completed = await waitUntil {
+            session.framebufferImageCreationCount == 2
+        }
+        XCTAssertTrue(completed, "没有新数据时 reconcile 也要发出整帧图")
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertEqual(session.framebufferImageCreationCount, 2,
+                       "没有新数据时 reconcile 只再发一次整帧图")
+        XCTAssertEqual(presenter.presentRequestCount, 2,
+                       "没有新数据时 reconcile 也要补一帧")
+
+        session.detachFramebufferPresenter(presenter)
+        session.disconnect()
+    }
+
     private static func desktopSizeFramebufferUpdate(
         width: UInt16,
         height: UInt16

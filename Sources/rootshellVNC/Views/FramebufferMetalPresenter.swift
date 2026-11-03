@@ -117,6 +117,8 @@ final class FramebufferMetalPresenter: @unchecked Sendable {
     init?() {
         guard let device = MTLCreateSystemDefaultDevice(),
               let commandQueue = device.makeCommandQueue() else { return nil }
+        // 采样时区分绘制来源：GPU 统计里这条队列标成屏幕共享呈现。
+        commandQueue.label = "agito.vnc.present"
         self.device = device
         self.commandQueue = commandQueue
     }

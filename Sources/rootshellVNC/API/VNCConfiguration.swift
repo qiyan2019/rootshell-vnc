@@ -343,6 +343,11 @@ public struct VNCConfiguration: Sendable {
     /// Valid range is 1...120; values outside this range are clamped.
     public var targetFrameRate: Int
 
+    /// 没操作时 GPU 呈现降到的帧率上限；`nil` 不启用，行为和以前完全一样。
+    /// 只影响纹理呈现这一路，图片发布节奏和 `targetFrameRate` 不变。
+    /// 距上次用户操作不到一秒时仍按 `targetFrameRate` 呈现。
+    public var passivePresentationFrameRate: Int?
+
     /// Whether to enable protocol tracing for debugging.
     ///
     /// When `true`, protocol message metadata is recorded with timestamps.
@@ -383,7 +388,8 @@ public struct VNCConfiguration: Sendable {
         transportProvider: VNCTransportProvider? = nil,
         datagramProvider: VNCDatagramProvider? = nil,
         securityPolicy: VNCSecurityPolicy = .automatic,
-        certificateValidationHandler: VNCCertificateValidationHandler? = nil
+        certificateValidationHandler: VNCCertificateValidationHandler? = nil,
+        passivePresentationFrameRate: Int? = nil
     ) {
         self.preferredPixelFormat = preferredPixelFormat
         self.preferredEncodings = preferredEncodings
@@ -421,6 +427,9 @@ public struct VNCConfiguration: Sendable {
         self.cursorRendering = cursorRendering
         self.remoteSystem = remoteSystem
         self.targetFrameRate = max(1, min(120, targetFrameRate))
+        self.passivePresentationFrameRate = passivePresentationFrameRate.map {
+            max(1, min(120, $0))
+        }
         self.enableProtocolTrace = enableProtocolTrace
         self.reconnectionPolicy = reconnectionPolicy
         self.securityPolicy = securityPolicy

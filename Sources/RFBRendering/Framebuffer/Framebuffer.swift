@@ -319,6 +319,9 @@ public final class Framebuffer: @unchecked Sendable {
 
     // MARK: - Read operations
 
+    /// 整帧图创建次数（测试用）：这是最贵的一次拷贝，挂起时一次都不该发生。
+    public private(set) var imageCreationCount = 0
+
     /// Create a CGImage snapshot of the current framebuffer. Thread-safe.
     ///
     /// 显式拷贝，不用 `CGContext.makeImage()`：后者走写时复制，下一次写要逐页缺页，
@@ -326,6 +329,7 @@ public final class Framebuffer: @unchecked Sendable {
     public func createImage() -> CGImage? {
         lock.lock()
         defer { lock.unlock() }
+        imageCreationCount &+= 1
         storage.beginAccess(readOnly: true)
         defer { storage.endAccess(readOnly: true) }
         let byteCount = bytesPerRow * height
