@@ -1433,6 +1433,20 @@ public actor TransportSession {
         try await sendOneShotFramebufferUpdateRequest(incremental: incremental)
     }
 
+    /// 首帧底图恢复用（Agito）：补要一张参考帧。
+    /// 订阅激活时补的就是这条非增量 type 3；type 9 生效后也照发，不走
+    /// `requestFramebufferUpdate` 的续订分支。续订不会让服务端重发整帧。
+    public func requestAppleDCTReferenceFrame() async throws {
+        guard fbWidth > 0, fbHeight > 0 else { return }
+        try await sendOneShotFramebufferUpdateRequest(incremental: false)
+    }
+
+    /// 控制通道累计入站字节。读到就计数，不等整条消息读完，
+    /// 首帧恢复用它区分「整帧还在路上」和「请求已经丢了」。
+    public func controlChannelReceivedByteCount() -> UInt64 {
+        controlChannelBytesReceived
+    }
+
     private func sendOneShotFramebufferUpdateRequest(
         incremental: Bool
     ) async throws {

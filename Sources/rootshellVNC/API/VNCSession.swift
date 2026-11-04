@@ -326,17 +326,37 @@ struct StandardInitialFramePresentationTracker {
     private(set) var uncoveredRegions: [CGRect] = []
     private var detectedDCTBootstrap = false
     private var completedInitialFrame = false
-    private var trackedSize: CGSize = .zero
+    /// 首帧恢复等太久时强制放行：先显示已收到的部分，覆盖度照样继续统计，
+    /// 恢复逻辑靠它决定还要不要补要整帧。
+    private(set) var presentationForced = false
+    private(set) var trackedSize: CGSize = .zero
 
     var suppressesPresentation: Bool {
+        detectedDCTBootstrap && !completedInitialFrame && !presentationForced
+    }
+
+    /// 还在等 DCT 首帧盖满（不论是否已强制放行）。
+    var awaitsInitialCoverage: Bool {
         detectedDCTBootstrap && !completedInitialFrame
+    }
+
+    /// 还没盖到的像素面积。
+    var uncoveredArea: Double {
+        uncoveredRegions.reduce(0) { $0 + Double($1.width * $1.height) }
     }
 
     mutating func reset() {
         uncoveredRegions.removeAll(keepingCapacity: true)
         detectedDCTBootstrap = false
         completedInitialFrame = false
+        presentationForced = false
         trackedSize = .zero
+    }
+
+    /// 放行呈现但不结束覆盖统计。只在确实还在等首帧时生效。
+    mutating func forcePresentation() {
+        guard awaitsInitialCoverage else { return }
+        presentationForced = true
     }
 
     /// `displayRegions` is the server's announced display layout. When the
@@ -409,7 +429,7 @@ struct StandardInitialFramePresentationTracker {
             || coversAnnouncedDisplays(displayRegions) {
             completedInitialFrame = true
         }
-        return completedInitialFrame
+        return completedInitialFrame || presentationForced
     }
 
     /// True when at least one announced display is fully covered and no
@@ -1208,6 +1228,19 @@ public final class VNCSession {
     @ObservationIgnored
     private var initialFramePresentationTracker =
         StandardInitialFramePresentationTracker()
+    /// 首帧底图恢复任务（`StandardInitialFrameRecoveryPolicy`），每代帧缓冲至多一个。
+    @ObservationIgnored
+    private var initialFrameRecoveryTask: Task<Void, Never>?
+    /// 本代帧缓冲已应用的像素批次数。首帧恢复靠它判断到的是不是只有变化区域。
+    @ObservationIgnored
+    private var standardFramebufferAppliedPixelBatches: UInt64 = 0
+    /// 以下三项只给首帧恢复的诊断日志用。
+    @ObservationIgnored
+    private var initialFrameRecoveryStartNanos: UInt64 = 0
+    @ObservationIgnored
+    private var initialFrameRecoveryRenewals = 0
+    @ObservationIgnored
+    private var initialFramePartialPresented = false
     /// A zero-sized ServerInit lets Apple display records build the usable
     /// standard-mode union incrementally until a stronger resize source wins.
     @ObservationIgnored
@@ -2764,6 +2797,7 @@ public final class VNCSession {
                 framebufferWidth: framebufferWidth,
                 framebufferHeight: framebufferHeight,
                 displayRegions: remoteDisplayRegions)
+        noteInitialFrameCoverage(transport: transport)
         let displaySuspended = suspendsDisplayPresentation
             || VNCPresentationPolicy.isPresentationProhibited()
         let takeSnapshot = publishDue
@@ -2808,6 +2842,9 @@ public final class VNCSession {
         guard transportSession === transport,
               framebufferPresentationGeneration == presentationGeneration,
               self.renderer === renderer else { return false }
+        if carriesFramebufferPixels {
+            standardFramebufferAppliedPixelBatches &+= 1
+        }
         if carriesFramebufferPixels && initialFramePresentationAllowed {
             standardFramebufferHasPresentablePixels = true
         }
@@ -4592,6 +4629,16 @@ public final class VNCSession {
         trailingSnapshotTask = nil
         trailingFramePresentTask?.cancel()
         trailingFramePresentTask = nil
+        if initialFrameRecoveryTask != nil {
+            logger.info(
+                "InitialFrame abandoned uncovered=\(initialFrameUncoveredPercent())% "
+                    + "elapsed=\(initialFrameRecoveryElapsedSeconds())s "
+                    + "renewals=\(initialFrameRecoveryRenewals) "
+                    + "partialShown=\(initialFramePartialPresented)")
+            initialFrameRecoveryTask?.cancel()
+            initialFrameRecoveryTask = nil
+        }
+        standardFramebufferAppliedPixelBatches = 0
         initialFramePresentationTracker.reset()
         standardFramebufferHasPresentablePixels = false
         framebufferHasUnpresentedPixels = true
@@ -4600,6 +4647,116 @@ public final class VNCSession {
         lastFramePresentNanos = 0
         deferredFramebufferRects.removeAll(keepingCapacity: true)
         deferredFramebufferBytes = 0
+    }
+
+    // MARK: - 首帧底图恢复（Agito）
+
+    /// 每批画面过完首帧门后调用：开始等首帧时起恢复任务，盖满时收尾。
+    private func noteInitialFrameCoverage(transport: TransportSession) {
+        if initialFramePresentationTracker.awaitsInitialCoverage {
+            startInitialFrameRecoveryIfNeeded(transport: transport)
+        } else if initialFrameRecoveryTask != nil {
+            finishInitialFrameRecovery()
+        }
+    }
+
+    private func startInitialFrameRecoveryIfNeeded(transport: TransportSession) {
+        guard initialFrameRecoveryTask == nil else { return }
+        let generation = framebufferPresentationGeneration
+        let start = DispatchTime.now().uptimeNanoseconds
+        initialFrameRecoveryStartNanos = start
+        initialFrameRecoveryRenewals = 0
+        initialFramePartialPresented = false
+        let size = initialFramePresentationTracker.trackedSize
+        logger.info("InitialFrame waiting size=\(Int(size.width))x\(Int(size.height))")
+        initialFrameRecoveryTask = Task { [weak self] in
+            var policy = StandardInitialFrameRecoveryPolicy(startNanos: start)
+            while !Task.isCancelled {
+                try? await Task.sleep(
+                    nanoseconds: StandardInitialFrameRecoveryPolicy.checkIntervalNanos)
+                guard !Task.isCancelled, let self,
+                      self.isCurrentInitialFrameRecovery(generation, transport)
+                else { return }
+                let receivedBytes = await transport.controlChannelReceivedByteCount()
+                guard !Task.isCancelled,
+                      self.isCurrentInitialFrameRecovery(generation, transport),
+                      self.initialFramePresentationTracker.awaitsInitialCoverage
+                else { return }
+                let decision = policy.evaluate(.init(
+                    nanos: DispatchTime.now().uptimeNanoseconds,
+                    uncoveredArea: self.initialFramePresentationTracker.uncoveredArea,
+                    appliedPixelBatches: self.standardFramebufferAppliedPixelBatches,
+                    receivedBytes: receivedBytes))
+                if decision.renew {
+                    self.initialFrameRecoveryRenewals = policy.renewals
+                    self.logger.info(
+                        "InitialFrame renew n=\(policy.renewals) "
+                            + "uncovered=\(self.initialFrameUncoveredPercent())% "
+                            + "elapsed=\(self.initialFrameRecoveryElapsedSeconds())s "
+                            + "batches=+\(decision.batchesSinceLastCheck) "
+                            + "bytesIn=+\(decision.bytesSinceLastCheck)"
+                            + (decision.reachedRenewalLimit ? " limitReached=true" : ""))
+                    do {
+                        try await transport.requestAppleDCTReferenceFrame()
+                    } catch {
+                        self.logger.warning("InitialFrame renew failed: \(error)")
+                    }
+                }
+                if decision.presentPartial,
+                   self.isCurrentInitialFrameRecovery(generation, transport) {
+                    self.presentPartialInitialFrame()
+                }
+            }
+        }
+    }
+
+    private func isCurrentInitialFrameRecovery(
+        _ generation: UInt64,
+        _ transport: TransportSession
+    ) -> Bool {
+        transportSession === transport
+            && framebufferPresentationGeneration == generation
+    }
+
+    private func finishInitialFrameRecovery() {
+        initialFrameRecoveryTask?.cancel()
+        initialFrameRecoveryTask = nil
+        let via = initialFramePresentationTracker.uncoveredRegions.isEmpty
+            ? "coverage" : "displays"
+        logger.info(
+            "InitialFrame covered via=\(via) "
+                + "elapsed=\(initialFrameRecoveryElapsedSeconds())s "
+                + "renewals=\(initialFrameRecoveryRenewals) "
+                + "partialShown=\(initialFramePartialPresented)")
+    }
+
+    /// 等太久：先放行显示已收到的部分。之后的批次照常呈现，补发继续到盖满。
+    private func presentPartialInitialFrame() {
+        initialFramePresentationTracker.forcePresentation()
+        guard !initialFramePresentationTracker.suppressesPresentation else { return }
+        initialFramePartialPresented = true
+        logger.info(
+            "InitialFrame partial uncovered=\(initialFrameUncoveredPercent())% "
+                + "elapsed=\(initialFrameRecoveryElapsedSeconds())s "
+                + "renewals=\(initialFrameRecoveryRenewals)")
+        standardFramebufferHasPresentablePixels = true
+        framebufferHasUnpresentedPixels = true
+        framebufferHasUnpublishedPixels = true
+        // 尾帧任务同时负责画到呈现器和发布 `currentImage`，挂起时它自己会让路给恢复路径。
+        scheduleTrailingSnapshot(interval: 0)
+    }
+
+    private func initialFrameUncoveredPercent() -> String {
+        let size = initialFramePresentationTracker.trackedSize
+        let total = Double(size.width * size.height)
+        guard total > 0 else { return "-" }
+        let percent = initialFramePresentationTracker.uncoveredArea / total * 100
+        return String(format: "%.1f", percent)
+    }
+
+    private func initialFrameRecoveryElapsedSeconds() -> String {
+        let elapsed = DispatchTime.now().uptimeNanoseconds &- initialFrameRecoveryStartNanos
+        return String(format: "%.1f", Double(elapsed) / 1_000_000_000)
     }
 
     private static func batchableInputEvent(
