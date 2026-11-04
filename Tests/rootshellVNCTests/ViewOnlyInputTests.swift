@@ -240,6 +240,33 @@ final class LoginPasswordDeliveryTests: XCTestCase {
         XCTAssertTrue(harness.session.loginPasswordPromptPending)
         harness.session.disconnect()
     }
+
+    func testPromptDefersUntilFirstFrameArrives() async throws {
+        let harness = try await ViewOnlyHarness.connected()
+        harness.session.configuration.promptForLoginPasswordAtLoginWindow = true
+        // 信号公告先于任何一帧：提示挂起，不在黑屏上弹确认框。
+        harness.session.handleAppleRemoteSessionState(AppleRemoteSessionState(
+            loginWindowActive: true,
+            loginWindowLockScreenActive: false))
+        XCTAssertFalse(harness.session.loginPasswordPromptPending)
+        // 首帧落地立即补弹。
+        harness.session.considerAppleLoginVisionImageForTesting(Self.testImage)
+        XCTAssertTrue(harness.session.loginPasswordPromptPending)
+        harness.session.disconnect()
+    }
+
+    func testPromptFallsBackAfterFrameWaitMax() async throws {
+        let harness = try await ViewOnlyHarness.connected()
+        harness.session.configuration.promptForLoginPasswordAtLoginWindow = true
+        harness.session.handleAppleRemoteSessionState(AppleRemoteSessionState(
+            loginWindowActive: true,
+            loginWindowLockScreenActive: false))
+        XCTAssertFalse(harness.session.loginPasswordPromptPending)
+        // 有界兜底：10s 一直没帧也要弹，提示不能被永久压住。
+        try await Task.sleep(for: .seconds(11))
+        XCTAssertTrue(harness.session.loginPasswordPromptPending)
+        harness.session.disconnect()
+    }
 }
 
 @MainActor
