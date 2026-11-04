@@ -115,6 +115,24 @@ final class ViewOnlySessionTests: XCTestCase {
 
 @MainActor
 final class LoginPasswordDeliveryTests: XCTestCase {
+    private static var testImage: CGImage {
+        let bytes = Data([0, 0, 0, 0])
+        let provider = CGDataProvider(data: bytes as CFData)!
+        return CGImage(
+            width: 1,
+            height: 1,
+            bitsPerComponent: 8,
+            bitsPerPixel: 32,
+            bytesPerRow: 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo(
+                rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+            provider: provider,
+            decode: nil,
+            shouldInterpolate: false,
+            intent: .defaultIntent)!
+    }
+
     func testUnconnectedOrViewOnlySendIsNotSent() async throws {
         let idle = await VNCSession().sendLoginPassword { true }
         XCTAssertEqual(idle, .notSent)
@@ -137,10 +155,11 @@ final class LoginPasswordDeliveryTests: XCTestCase {
         }
         XCTAssertEqual(result, .stopped)
         XCTAssertGreaterThan(checks, 0)
+        // 无密码行坐标：不点击；停止点在开头 150ms 暂停后，一个键都不该发出。
         let added = Data((await harness.connection.sentBytes()).dropFirst(before))
         let click = ClientMessage.pointerEvent(buttonMask: 0, x: 4, y: 4).serialize()
         let selectAll = ClientMessage.keyEvent(downFlag: true, key: 0x61).serialize()
-        XCTAssertNotNil(added.range(of: click))
+        XCTAssertNil(added.range(of: click))
         XCTAssertNil(added.range(of: selectAll))
         harness.session.disconnect()
     }
@@ -203,6 +222,8 @@ final class LoginPasswordDeliveryTests: XCTestCase {
     func testRecheckOffersThePromptWhenLoginStaysActive() async throws {
         let harness = try await ViewOnlyHarness.connected()
         harness.session.configuration.promptForLoginPasswordAtLoginWindow = true
+        // 「提示等首帧」：喂一帧候选，公告到来时提示直接弹而不是挂起。
+        harness.session.considerAppleLoginVisionImageForTesting(Self.testImage)
         harness.session.handleAppleRemoteSessionState(AppleRemoteSessionState(
             loginWindowActive: true,
             loginWindowLockScreenActive: false))

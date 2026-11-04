@@ -29,19 +29,36 @@ final class LoginPasswordInputTests: XCTestCase {
         ])
     }
 
-    func testPasswordLineCenterFlipsVisionYAndFallsBackToFrameCenter() {
-        let center = VNCSession.loginPasswordClickPoint(
+    func testPasswordLineCenterFlipsVisionYAndStaysNilWithoutCoords() {
+        // 无坐标不再退化成帧中心：盲击会把默认持焦的安全字段点失焦。
+        XCTAssertNil(VNCSession.loginPasswordClickPoint(
             passwordLineCenter: nil,
             framebufferWidth: 200,
-            framebufferHeight: 100)
-        XCTAssertEqual(center.x, 100)
-        XCTAssertEqual(center.y, 50)
+            framebufferHeight: 100))
         let line = VNCSession.loginPasswordClickPoint(
             passwordLineCenter: CGPoint(x: 0.25, y: 0.2),
             framebufferWidth: 200,
             framebufferHeight: 100)
-        XCTAssertEqual(line.x, 50)
-        XCTAssertEqual(line.y, 80)
+        XCTAssertEqual(line?.x, 50)
+        XCTAssertEqual(line?.y, 80)
+    }
+
+    func testFieldClearEventsContainNoPointerWhenCoordsMissing() {
+        let events = VNCSession.loginPasswordFieldClearInputEvents()
+        XCTAssertFalse(events.contains { event in
+            if case .pointer = event { return true }
+            return false
+        })
+        // 仍保留 Cmd+A + Backspace 清残输入。
+        XCTAssertTrue(events.contains { event in
+            if case .key(true, 0x61) = event { return true }
+            return false
+        })
+        XCTAssertTrue(events.contains { event in
+            if case .key(true, let k) = event,
+               k == KeyboardInputHandler.keysymBackspace { return true }
+            return false
+        })
     }
 
     func testPasswordFocusClickClearsFieldBeforeTypingBarrier() {

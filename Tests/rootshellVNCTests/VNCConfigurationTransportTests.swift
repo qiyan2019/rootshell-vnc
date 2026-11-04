@@ -629,6 +629,8 @@ final class VNCConfigurationTransportTests: XCTestCase {
         }
         XCTAssertTrue(connected)
 
+        // 「提示等首帧」：信号公告要求弹窗前已有参照帧；先喂一帧候选，等价于首帧已落地。
+        session.considerAppleLoginVisionImageForTesting(Self.visionTestImage())
         await connection.enqueueServerBytes(
             Self.appleLoginFramebufferUpdate(screenFlags: 0x10))
         let prompted = await waitUntil {

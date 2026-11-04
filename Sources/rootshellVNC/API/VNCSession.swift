@@ -1111,6 +1111,12 @@ public final class VNCSession {
     private var lastLoginPasswordDeliveryNanos: UInt64 = 0
     @ObservationIgnored
     private var loginPasswordPromptRecheckTask: Task<Void, Never>?
+    /// 信号公告先于首帧时挂起的提示；首帧落地即弹，超 [loginPasswordPromptFrameWaitMax]
+    /// 无帧也兜底弹出（用户盲发仍有默认焦点兜底，不能永远不发）。
+    @ObservationIgnored
+    private var deferredLoginPromptSource: String?
+    @ObservationIgnored
+    private var deferredLoginPromptTask: Task<Void, Never>?
     /// Uptime of the newest Apple session-state announcement, regardless of
     /// its content. Apple servers repeat DisplayInfo2 while a layout is
     /// stable, so "an announcement newer than X" is a liveness signal the
@@ -1677,14 +1683,19 @@ public final class VNCSession {
             return .delivered
         }
 
+        if passwordLineCenter == nil {
+            await acquireLoginPasswordLineCenter()
+        }
         logger.info("Sending approved login password input")
         lastLoginPasswordDeliveryNanos = DispatchTime.now().uptimeNanoseconds
         let focus = Self.loginPasswordClickPoint(
             passwordLineCenter: passwordLineCenter,
             framebufferWidth: framebufferWidth,
             framebufferHeight: framebufferHeight)
-        let events = Self.loginPasswordFocusInputEvents(x: focus.x, y: focus.y)
-            + Self.loginPasswordInputEvents(password: password)
+        let focusEvents = focus.map {
+            Self.loginPasswordFocusInputEvents(x: $0.x, y: $0.y)
+        } ?? Self.loginPasswordFieldClearInputEvents()
+        let events = focusEvents + Self.loginPasswordInputEvents(password: password)
         let canStop = Self.loginPasswordCanStop(before: events)
         var lastCheckNanos = DispatchTime.now().uptimeNanoseconds
         for (index, event) in events.enumerated() {
@@ -1738,7 +1749,10 @@ public final class VNCSession {
             passwordLineCenter: passwordLineCenter,
             framebufferWidth: framebufferWidth,
             framebufferHeight: framebufferHeight)
-        let events = Self.loginPasswordFocusInputEvents(x: focus.x, y: focus.y)
+        let focusEvents = focus.map {
+            Self.loginPasswordFocusInputEvents(x: $0.x, y: $0.y)
+        } ?? Self.loginPasswordFieldClearInputEvents()
+        let events = focusEvents
             + Self.loginPasswordInputEvents(password: password)
         for event in events {
             switch event {
@@ -1755,6 +1769,34 @@ public final class VNCSession {
         }
     }
 
+    /// 信号公告先于 Vision 检出时 `passwordLineCenter` 为空（信号一到检测即
+    /// 被跳过，见 `handleAppleRemoteSessionState`）。发送前对最近一帧做一次
+    /// 有界 OCR 补坐标；仍拿不到就不点击，靠 loginwindow 的默认焦点打字。
+    private func acquireLoginPasswordLineCenter() async {
+        let frame: AppleLoginVisionFrame
+        if let latest = appleLoginVisionLatestFrame {
+            frame = latest.frame
+        } else if let image = currentImage {
+            frame = .image(image)
+        } else {
+            return
+        }
+        let analysis: AppleLoginTextAnalysis? = await Task.detached(
+            priority: .utility
+        ) {
+            switch frame {
+            case .image(let image):
+                return try? AppleLoginScreenDetector.recognize(cgImage: image)
+            case .pixelBuffer(let pixelBuffer):
+                return try? AppleLoginScreenDetector.recognize(
+                    pixelBuffer: pixelBuffer)
+            }
+        }.value
+        guard let analysis, analysis.isLoginScreen else { return }
+        appleLoginVisionDetected = true
+        passwordLineCenter = analysis.passwordLineCenter
+    }
+
     /// Focus macOS Login Window before typing. Pointer events and the pause
     /// share the ordered input queue with the password, so no key can overtake
     /// the click that establishes the secure field's first responder. The
@@ -1769,6 +1811,14 @@ public final class VNCSession {
             .pointer(buttonMask: 0, x: x, y: y),
             .pointer(buttonMask: 1, x: x, y: y),
             .pointer(buttonMask: 0, x: x, y: y),
+        ] + loginPasswordFieldClearInputEvents()
+    }
+
+    /// 无密码行坐标时的清空段：不做指针点击。退化成点帧中心可能落在密码框外，
+    /// 反而让 loginwindow 默认持焦的安全字段失焦（本机实测首发因此打空）；
+    /// 不点击、只保留 Cmd+A + Backspace 清掉上次中断留下的残输入。
+    nonisolated static func loginPasswordFieldClearInputEvents() -> [SessionInputEvent] {
+        [
             .pause(nanoseconds: 150_000_000),
             .key(downFlag: true, keysym: KeyboardInputHandler.keysymSuperL),
             .key(downFlag: true, keysym: 0x61),
@@ -1844,18 +1894,16 @@ public final class VNCSession {
     }
 
     /// 密码行中心是 Vision 的归一化坐标，原点在左下。指针的 y 向下，所以要翻转。
-    /// 没有坐标时点帧中心。
+    /// 没有坐标时返回 nil：调用方跳过点击，绝不能退化成点帧中心。
     nonisolated static func loginPasswordClickPoint(
         passwordLineCenter: CGPoint?,
         framebufferWidth: Int,
         framebufferHeight: Int
-    ) -> (x: UInt16, y: UInt16) {
+    ) -> (x: UInt16, y: UInt16)? {
         guard let passwordLineCenter,
               framebufferWidth > 0,
               framebufferHeight > 0 else {
-            return (
-                UInt16(clamping: framebufferWidth / 2),
-                UInt16(clamping: framebufferHeight / 2))
+            return nil
         }
         let x = Int((passwordLineCenter.x * CGFloat(framebufferWidth)).rounded())
         let y = Int(((1 - passwordLineCenter.y) * CGFloat(framebufferHeight)).rounded())
@@ -3365,6 +3413,7 @@ public final class VNCSession {
         cancelLoginPasswordSendWatchdog()
         loginPasswordPromptRecheckTask?.cancel()
         loginPasswordPromptRecheckTask = nil
+        clearDeferredLoginPrompt()
         lastSessionStateAnnouncementNanos = 0
         // An explicit disconnect/new connect begins a new logical login
         // attempt, so a password delivered by the previous connection must
@@ -3409,6 +3458,8 @@ public final class VNCSession {
     private static let loginPasswordPromptRecheckDelay =
         Duration.milliseconds(2_500)
     private static let loginPasswordPromptRecheckMaxRounds = 4
+    /// 提示等首帧的最长窗口：首帧迟迟不到也弹出，免得用户在黑屏前无从操作。
+    private static let loginPasswordPromptFrameWaitMax = Duration.seconds(10)
     /// 投递途中两次询问 `shouldContinue` 的最小间隔。
     private static let loginPasswordContinueCheckNanos: UInt64 = 100_000_000
 
@@ -3477,7 +3528,10 @@ public final class VNCSession {
     /// transients must not present a second dialog for a password that just
     /// landed. Display logic only — no path here ever sends the password
     /// without a fresh confirmation.
-    private func offerLoginPasswordPrompt(source: String) {
+    private func offerLoginPasswordPrompt(
+        source: String,
+        allowWithoutFrame: Bool = false
+    ) {
         let sinceDelivery = DispatchTime.now().uptimeNanoseconds
             &- lastLoginPasswordDeliveryNanos
         if lastLoginPasswordDeliveryNanos != 0,
@@ -3485,8 +3539,43 @@ public final class VNCSession {
             scheduleLoginPasswordPromptRecheck(source: source)
             return
         }
+        // 一帧都还没到时先不弹：黑屏上的确认框既无参照也没法判断该不该发。
+        if !allowWithoutFrame, !hasFrameForLoginPrompt {
+            deferLoginPasswordPrompt(source: source)
+            return
+        }
+        clearDeferredLoginPrompt()
         loginPasswordPromptPending = true
         logger.info("Login password prompt offered (\(source))")
+    }
+
+    /// 提示前要求至少有一帧可参考：已发布的图像或 vision 留住的候选帧。
+    private var hasFrameForLoginPrompt: Bool {
+        currentImage != nil || appleLoginVisionLatestFrame != nil
+    }
+
+    private func deferLoginPasswordPrompt(source: String) {
+        if deferredLoginPromptSource == nil {
+            deferredLoginPromptSource = source
+            logger.info(
+                "Login prompt deferred until the first frame (\(source))")
+        }
+        guard deferredLoginPromptTask == nil else { return }
+        deferredLoginPromptTask = Task { [weak self] in
+            try? await Task.sleep(for: Self.loginPasswordPromptFrameWaitMax)
+            guard let self, !Task.isCancelled,
+                  let pending = self.deferredLoginPromptSource else { return }
+            self.clearDeferredLoginPrompt()
+            self.offerLoginPasswordPrompt(
+                source: pending,
+                allowWithoutFrame: true)
+        }
+    }
+
+    private func clearDeferredLoginPrompt() {
+        deferredLoginPromptSource = nil
+        deferredLoginPromptTask?.cancel()
+        deferredLoginPromptTask = nil
     }
 
     /// Only fresh evidence may resurrect the dialog after a delivery: the
@@ -3778,6 +3867,12 @@ public final class VNCSession {
             frame,
             source,
             highPerformanceGeneration)
+        // 首帧落地：被信号公告挂起的提示现在有画面参照，立即弹出。
+        if let deferred = deferredLoginPromptSource {
+            clearDeferredLoginPrompt()
+            offerLoginPasswordPrompt(
+                source: deferred + " (first frame)")
+        }
         guard appleServerProtocolObserved else {
             logger.debug(
                 "Retaining login Vision candidate until Apple protocol is observed")
