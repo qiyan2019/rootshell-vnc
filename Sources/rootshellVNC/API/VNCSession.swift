@@ -908,6 +908,9 @@ public final class VNCSession {
     /// these to present only the number of displays selected by the user.
     private(set) var remoteDisplayRegions: [CGRect] = []
 
+    /// 用户在本次连接里手动选过显示器。
+    var presentsWholeFramebuffer = false
+
     /// 已发现的显示器，顺序与服务端通告一致。零尺寸记录不出现。
     public var remoteDisplays: [VNCRemoteDisplay] {
         remoteDisplayRegionOrder.compactMap { id in
@@ -1440,6 +1443,7 @@ public final class VNCSession {
         serverCapabilities = nil
         activeVideoDisplayCount = 1
         remoteDisplayRegions = []
+        presentsWholeFramebuffer = false
         remoteDisplayRegionByID = [:]
         remoteDisplayRegionOrder = []
         invalidateStandardFramebufferPresentation()
@@ -1537,6 +1541,7 @@ public final class VNCSession {
         serverCapabilities = nil
         activeVideoDisplayCount = 1
         remoteDisplayRegions = []
+        presentsWholeFramebuffer = false
         remoteDisplayRegionByID = [:]
         remoteDisplayRegionOrder = []
         invalidateStandardFramebufferPresentation()
@@ -2161,7 +2166,9 @@ public final class VNCSession {
         let known = remoteDisplays
         guard !known.isEmpty else { return false }
         if let id, !known.contains(where: { $0.id == id }) { return false }
-        return await transport.selectStandardRemoteDisplay(id: id)
+        let selected = await transport.selectStandardRemoteDisplay(id: id)
+        if selected { presentsWholeFramebuffer = true }
+        return selected
     }
 
     /// Curtain or uncurtain the remote Mac's own display.
@@ -2706,6 +2713,8 @@ public final class VNCSession {
     /// Selected framebuffer rectangle in the server's normalized desktop
     /// coordinates. Nil means the server has not described its monitor layout.
     var presentedFramebufferRegion: CGRect? {
+        // 用户手动切屏后，帧缓冲就是选中的内容，第一块显示器的区域已经不适用。
+        guard !presentsWholeFramebuffer else { return nil }
         // Match Client replaces the physical monitor topology with equal-sized
         // virtual displays. DisplayInfo from the pre-reconfiguration desktop
         // can remain in flight, so its rectangles are not authoritative here.
@@ -3296,6 +3305,7 @@ public final class VNCSession {
         serverCapabilities = nil
         activeVideoDisplayCount = 1
         remoteDisplayRegions = []
+        presentsWholeFramebuffer = false
         remoteDisplayRegionByID = [:]
         remoteDisplayRegionOrder = []
         remoteCursor = nil

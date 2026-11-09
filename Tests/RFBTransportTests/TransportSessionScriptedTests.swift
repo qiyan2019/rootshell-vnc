@@ -1930,7 +1930,7 @@ final class TransportSessionScriptedTests: XCTestCase {
     }
 
     /// 切换后服务端按新显示器尺寸编码且清了缓存：帧缓冲要先换尺寸，再要一张整帧。
-    func testReselectingDisplayAdoptsGeometryAndRequestsFullFrame() async throws {
+    func testReselectingDisplayWaitsForServerConfirmationBeforeFullFrame() async throws {
         let firstID: UInt32 = 1
         let secondID: UInt32 = 3
         let displays = [
@@ -1976,29 +1976,29 @@ final class TransportSessionScriptedTests: XCTestCase {
 
         let selected = await session.selectStandardRemoteDisplay(id: secondID)
         XCTAssertTrue(selected)
-        var expected = Self.setDisplayMessage(id: secondID)
-        expected.append(Data([0x03, 0x00, 0, 0, 0, 0, 0, 4, 0, 2]))
-        let sent = await connection.sentBytes()
-        XCTAssertEqual(
-            Self.occurrenceCount(of: expected, in: sent), 1,
-            "SetDisplay 后要紧跟按新尺寸的非增量请求")
+        let setDisplay = Self.setDisplayMessage(id: secondID)
+        let fullFrame = Data([0x03, 0x00, 0, 0, 0, 0, 0, 4, 0, 2])
+        var sent = await connection.sentBytes()
+        XCTAssertEqual(Self.occurrenceCount(of: setDisplay, in: sent), 1)
+        XCTAssertEqual(Self.occurrenceCount(of: fullFrame, in: sent), 0, "服务端确认前不要全量")
 
-        await connection.enqueueServerBytes(Self.framebufferUpdate([(
-            Self.rectangleHeader(x: 0, y: 0, width: 1, height: 1, encoding: 0),
-            Data([1, 2, 3, 4])
-        )]))
+        // DisplayInfo2 到达才算切屏生效。
+        await connection.enqueueServerBytes(Self.framebufferUpdate([
+            (Self.rectangleHeader(x: 0, y: 0, width: 0, height: 0, encoding: 1105),
+             appleDisplayInfo2TestPayload(displays: displays)),
+            (Self.rectangleHeader(x: 0, y: 0, width: 1, height: 1, encoding: 0),
+             Data([1, 2, 3, 4])),
+        ]))
         let seen = await Self.withTimeout(seconds: 2) { await updates.value }
         let rects = try XCTUnwrap(seen?.last)
-        XCTAssertEqual(rects.first?.encoding, .desktopSize, "换尺寸要排在像素前面")
-        XCTAssertEqual(rects.first?.width, 4)
-        XCTAssertEqual(rects.first?.height, 2)
-
-        var global = Data([0x0d, 0x01, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff])
-        global.append(Data([0x03, 0x00, 0, 0, 0, 0, 0, 6, 0, 2]))
-        let combined = await session.selectStandardRemoteDisplay(id: nil)
-        XCTAssertTrue(combined)
-        let after = await connection.sentBytes()
-        XCTAssertEqual(Self.occurrenceCount(of: global, in: after), 1, "全部显示器按并集尺寸请求")
+        let resizeIndex = try XCTUnwrap(rects.firstIndex { $0.encoding == .desktopSize })
+        let pixelIndex = try XCTUnwrap(rects.firstIndex { $0.encoding == .raw })
+        XCTAssertLessThan(resizeIndex, pixelIndex, "换尺寸要排在像素前面")
+        XCTAssertEqual(rects[resizeIndex].width, 4)
+        XCTAssertEqual(rects[resizeIndex].height, 2)
+        try await Task.sleep(for: .milliseconds(100))
+        sent = await connection.sentBytes()
+        XCTAssertEqual(Self.occurrenceCount(of: fullFrame, in: sent), 1, "确认后要按新尺寸全量")
         await session.disconnect()
     }
 

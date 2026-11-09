@@ -37,6 +37,27 @@ final class RemoteDisplaySelectionTests: XCTestCase {
         ])
     }
 
+    /// 手动切屏后不能再按第一块显示器裁剪，否则会采样到帧缓冲之外。
+    @MainActor
+    func testManualSelectionPresentsWholeFramebuffer() async {
+        let session = VNCSession()
+        await session.updateRemoteDisplayRegions([
+            AppleDisplayInfo(
+                displayIndex: 5, originX: 2992, originY: 0,
+                width: 3840, height: 2160, flags: 0),
+            AppleDisplayInfo(
+                displayIndex: 1, originX: 0, originY: 0,
+                width: 2992, height: 1934, flags: 0),
+        ])
+        session.framebufferWidth = 2992
+        session.framebufferHeight = 1934
+        XCTAssertNotNil(session.presentedFramebufferRegion)
+
+        session.presentsWholeFramebuffer = true
+        XCTAssertNil(session.presentedFramebufferRegion)
+        XCTAssertEqual(session.presentedFramebufferSize, CGSize(width: 2992, height: 1934))
+    }
+
     @MainActor
     func testSelectRemoteDisplayRefusesWhenNothingIsConnected() async {
         let session = VNCSession()

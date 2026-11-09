@@ -499,6 +499,10 @@ public actor TransportSession {
     /// and origin, without sending DesktopSize, so the update that announced
     /// it carries a synthesized resize to the selected display's dimensions.
     private var pendingSelectedDisplayResize: FramebufferRect?
+    /// 已发 SetDisplay、等服务端 DisplayInfo2 确认的目标尺寸。
+    private var pendingStandardDisplaySwitch: (width: UInt16, height: UInt16)?
+    /// 切屏确认后要按新尺寸补一份全量。
+    private var pendingDisplaySwitchFullFrame = false
     private var sentAppleMediaAutoFrameUpdate = false
     private var appleMediaGenerationTracker = AppleMediaNegotiationGenerationTracker()
     private var acceptedAppleMediaStream = false
@@ -2530,6 +2534,7 @@ public actor TransportSession {
                     completeAppleDisplayLayout = displayInfos
                     standardAnnouncedDisplayIDs = displayInfos.map(\.displayIndex)
                     standardAnnouncedDisplays = displayInfos
+                    applyPendingStandardDisplaySwitch()
                     emitAppleDisplayInfoCompatibilityEvents(displayInfos)
                     if let firstDisplay = displayInfos.first {
                         try await sendAppleStandardDisplaySelectionIfNeeded(
@@ -2693,6 +2698,11 @@ public actor TransportSession {
         }
 
         continuation?.yield(.framebufferUpdate(rectsWithData))
+
+        if pendingDisplaySwitchFullFrame {
+            pendingDisplaySwitchFullFrame = false
+            try await sendOneShotFramebufferUpdateRequest(incremental: false)
+        }
 
         // Pipeline the next incremental request the moment this update is
         // fully off the wire, so the server can produce the next update while
@@ -3392,9 +3402,29 @@ public actor TransportSession {
         if let id, !standardAnnouncedDisplayIDs.contains(id) {
             return false
         }
-        let target = standardSelectionGeometry(id: id)
-        // SetDisplay 会清服务端缓存、改编码范围：和首次选屏一样回到引导阶段，
-        // 否则 type-9 还订着旧尺寸，变化门控的流没有新底图可发。
+        // SetDisplay 生效前服务端还会发旧屏数据，生效时发 DisplayInfo2。
+        // 尺寸、DCT 引导和全量请求都等那一条，否则旧屏矩形会打乱解码状态。
+        pendingStandardDisplaySwitch = standardSelectionGeometry(id: id)
+        let payload = appleSetDisplayMessage(
+            isGlobal: id == nil,
+            displayID: id ?? 0)
+        do {
+            try await sendClientPayload(payload)
+            log.info("Sent Apple display reselection")
+            return true
+        } catch {
+            log.warning(
+                "Failed to reselect remote display: "
+                    + error.localizedDescription)
+            return false
+        }
+    }
+
+    /// 服务端用 DisplayInfo2 确认切屏后回到引导阶段，更新处理完后按新尺寸补一份全量。
+    /// 解码器的系数缓存环不能清：服务端切屏不清它，新屏矩形还会引用。
+    private func applyPendingStandardDisplaySwitch() {
+        guard let target = pendingStandardDisplaySwitch else { return }
+        pendingStandardDisplaySwitch = nil
         if appleDCTRequested {
             resetAppleDCTBootstrapCoverage()
             appleAutoUpdateActive = false
@@ -3405,27 +3435,7 @@ public actor TransportSession {
                 x: 0, y: 0, width: target.width, height: target.height,
                 encoding: .desktopSize)
         }
-        var payload = appleSetDisplayMessage(
-            isGlobal: id == nil,
-            displayID: id ?? 0)
-        // 帧缓冲要等下一批更新才换尺寸，这条请求直接按目标尺寸发。
-        payload.append(ClientMessage.framebufferUpdateRequest(
-            incremental: false,
-            x: 0, y: 0,
-            width: target.width,
-            height: target.height
-        ).serialize())
-        do {
-            try await sendClientPayload(payload)
-            framebufferRequestSentNanos = DispatchTime.now().uptimeNanoseconds
-            log.info("Reselected Apple display, framebuffer target \(target.width)x\(target.height)")
-            return true
-        } catch {
-            log.warning(
-                "Failed to reselect remote display: "
-                    + error.localizedDescription)
-            return false
-        }
+        pendingDisplaySwitchFullFrame = true
     }
 
     /// 选中显示器的尺寸；`nil` 是全部显示器的外接矩形。算不出来时保持当前尺寸。
