@@ -155,15 +155,15 @@ public final class VNCClipboardSynchronizer {
     @ObservationIgnored
     private weak var session: VNCSession?
     @ObservationIgnored
-    private var sessionObserverID: UUID?
+    private nonisolated(unsafe) var sessionObserverID: UUID?
     @ObservationIgnored
-    private var connectionStateObserverID: UUID?
+    private nonisolated(unsafe) var connectionStateObserverID: UUID?
     @ObservationIgnored
-    private var lifecycleObservers: [NSObjectProtocol] = []
+    private nonisolated(unsafe) var lifecycleObservers: [NSObjectProtocol] = []
     @ObservationIgnored
-    private var clipboardChangeObserver: NSObjectProtocol?
+    private nonisolated(unsafe) var clipboardChangeObserver: NSObjectProtocol?
     @ObservationIgnored
-    private var monitoringTask: Task<Void, Never>?
+    private nonisolated(unsafe) var monitoringTask: Task<Void, Never>?
 
     private var latestRemoteText: String?
     @ObservationIgnored
@@ -286,7 +286,9 @@ public final class VNCClipboardSynchronizer {
         }
     }
 
-    isolated deinit {
+    // 不用 `isolated deinit`：部署目标低于 iOS 18.4 / macOS 15.4 时走 back-deploy 的
+    // swift_task_deinitOnExecutor，在主线程释放时 abort（malloc 报 pointer being freed）。
+    deinit {
         monitoringTask?.cancel()
         if let clipboardChangeObserver {
             notificationCenter.removeObserver(clipboardChangeObserver)
@@ -294,12 +296,17 @@ public final class VNCClipboardSynchronizer {
         for observer in lifecycleObservers {
             notificationCenter.removeObserver(observer)
         }
-
-        if let sessionObserverID {
-            session?.removeServerClipboardObserver(sessionObserverID)
-        }
-        if let connectionStateObserverID {
-            session?.removeConnectionStateObserver(connectionStateObserverID)
+        // 这两个注册的回调都是 [weak self]，晚一拍摘掉不会回调到已释放的实例。
+        let sessionObserverID = sessionObserverID
+        let connectionStateObserverID = connectionStateObserverID
+        guard sessionObserverID != nil || connectionStateObserverID != nil else { return }
+        Task { @MainActor [weak session] in
+            if let sessionObserverID {
+                session?.removeServerClipboardObserver(sessionObserverID)
+            }
+            if let connectionStateObserverID {
+                session?.removeConnectionStateObserver(connectionStateObserverID)
+            }
         }
     }
 

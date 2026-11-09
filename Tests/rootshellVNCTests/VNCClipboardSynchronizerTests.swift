@@ -57,13 +57,6 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
             now: now)
     }
 
-    /// 这台机器上 `isolated deinit` 在测试结束时会 abort（改动前的同一用例也这样）。
-    /// 把实例留到进程结束，断言才能被记下来。生产代码的 deinit 不动。
-    private static var retained: [VNCClipboardSynchronizer] = []
-    private func retain(_ synchronizer: VNCClipboardSynchronizer) {
-        Self.retained.append(synchronizer)
-    }
-
     func testManualGetUsesLatestRemoteClipboardWhileSharingIsOff() {
         let clipboard = FakeClipboard()
         var sent: [String] = []
@@ -165,7 +158,6 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
 
         XCTAssertEqual(clipboard.text, "existing local")
         XCTAssertTrue(sent.isEmpty)
-        retain(synchronizer)
     }
 
     func testSharedClipboardTransfersBothDirectionsWithoutEcho() {
@@ -205,7 +197,6 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         synchronizer.connectionStateDidChange(.connected)
 
         XCTAssertEqual(sent, ["copied while reconnecting"])
-        retain(synchronizer)
     }
 
     func testConnectionBoundaryClearsCachedRemoteClipboard() {
@@ -434,7 +425,6 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         connected = true
         synchronizer.connectionStateDidChange(.connected)
         XCTAssertEqual(sent, ["copied in background"])
-        retain(synchronizer)
     }
 
     func testSendDroppedWithinFiveSecondsIsRetried() {
@@ -458,7 +448,6 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         connected = true
         synchronizer.connectionStateDidChange(.connected)
         XCTAssertEqual(sent, ["just sent", "just sent"])
-        retain(synchronizer)
     }
 
     func testSendConfirmedAfterFiveSecondsIsNotRetried() {
@@ -481,7 +470,6 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         connected = true
         synchronizer.connectionStateDidChange(.connected)
         XCTAssertEqual(sent, ["kept"])
-        retain(synchronizer)
     }
 
     func testFreshConnectDoesNotReplayADroppedSend() {
@@ -502,7 +490,6 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         connected = true
         synchronizer.connectionStateDidChange(.connected)
         XCTAssertEqual(sent, ["old server"])
-        retain(synchronizer)
     }
 
     func testConnectedDoesNotPullOrReplaceClipboards() {
@@ -522,7 +509,6 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         XCTAssertEqual(requests, 0)
         XCTAssertEqual(clipboard.text, "phone")
         XCTAssertTrue(sent.isEmpty)
-        retain(synchronizer)
     }
 
     func testExplicitPushSkipsUnchangedChangeCountAndDoesNotRead() {
@@ -538,7 +524,6 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         synchronizer.sendClipboardIfChanged()
         XCTAssertEqual(sent, ["same"])
         XCTAssertEqual(clipboard.readCount, readsAfterPush)
-        retain(synchronizer)
     }
 
     func testExplicitPushIgnoresEmptyText() {
@@ -549,7 +534,6 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
 
         synchronizer.sendClipboardIfChanged()
         XCTAssertEqual(sent, [])
-        retain(synchronizer)
     }
 
     func testExplicitPushWhileDisconnectedDoesNotCountAsSent() {
@@ -569,7 +553,6 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         connected = true
         synchronizer.sendClipboardIfChanged()
         XCTAssertEqual(sent, ["pending"])
-        retain(synchronizer)
     }
 
     func testExplicitPushDoesNotReadWhenNothingIsTransferable() {
@@ -582,7 +565,6 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         synchronizer.sendClipboardIfChanged()
         XCTAssertTrue(sent.isEmpty)
         XCTAssertEqual(clipboard.readCount, 0)
-        retain(synchronizer)
     }
 
     func testExplicitPushIgnoresTheSyncBaseline() {
@@ -595,7 +577,6 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
 
         synchronizer.sendClipboardIfChanged()
         XCTAssertEqual(sent, ["already there"])
-        retain(synchronizer)
     }
 
     func testDroppedExplicitPushIsSentAgainAfterReconnect() {
@@ -622,7 +603,6 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         connected = true
         synchronizer.sendClipboardIfChanged()
         XCTAssertEqual(sent, ["retry", "retry"])
-        retain(synchronizer)
     }
 
     func testRemoteApplyUpdatesTheSyncedChangeCount() {
@@ -636,6 +616,5 @@ final class VNCClipboardSynchronizerTests: XCTestCase {
         synchronizer.sendClipboardIfChanged()
         XCTAssertTrue(sent.isEmpty)
         XCTAssertEqual(clipboard.readCount, reads)
-        retain(synchronizer)
     }
 }

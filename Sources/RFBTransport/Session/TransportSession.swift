@@ -394,6 +394,8 @@ public actor TransportSession {
     private var appleMediaDisplayInfos: [AppleDisplayInfo] = []
     /// 标准模式 DisplayInfo2 通告过的 id。只给再次选择显示器用，别的路径不读。
     private var standardAnnouncedDisplayIDs: [UInt32] = []
+    /// 最近一次 1105 通告的显示器，用户切屏时按它算新的帧缓冲尺寸。
+    private var standardAnnouncedDisplays: [AppleDisplayInfo] = []
     /// Classic Apple display records arrive one rectangle at a time. Retain
     /// them while a zero-sized ServerInit is waiting for a usable union so the
     /// state machine and request loop advance with the same geometry as the
@@ -2527,6 +2529,7 @@ public actor TransportSession {
                     let displayInfos = appleDisplayInfo2Records(payload)
                     completeAppleDisplayLayout = displayInfos
                     standardAnnouncedDisplayIDs = displayInfos.map(\.displayIndex)
+                    standardAnnouncedDisplays = displayInfos
                     emitAppleDisplayInfoCompatibilityEvents(displayInfos)
                     if let firstDisplay = displayInfos.first {
                         try await sendAppleStandardDisplaySelectionIfNeeded(
@@ -2597,7 +2600,11 @@ public actor TransportSession {
             pendingSelectedDisplayResize = nil
             // A real DesktopSize in the same update is authoritative.
             if pendingResize == nil {
-                rectsWithData.append((selectedDisplayResize, Data()))
+                // 用户切屏时同一批里就有新显示器的像素，换尺寸必须排在它们前面。
+                let firstContent = rectsWithData.firstIndex { $0.0.encoding.isFramebufferContent }
+                rectsWithData.insert(
+                    (selectedDisplayResize, Data()),
+                    at: firstContent ?? rectsWithData.endIndex)
                 pendingResize = selectedDisplayResize
             }
         }
@@ -3385,10 +3392,33 @@ public actor TransportSession {
         if let id, !standardAnnouncedDisplayIDs.contains(id) {
             return false
         }
+        let target = standardSelectionGeometry(id: id)
+        // SetDisplay 会清服务端缓存、改编码范围：和首次选屏一样回到引导阶段，
+        // 否则 type-9 还订着旧尺寸，变化门控的流没有新底图可发。
+        if appleDCTRequested {
+            resetAppleDCTBootstrapCoverage()
+            appleAutoUpdateActive = false
+            deferredUpdateRequest = false
+        }
+        if target.width != fbWidth || target.height != fbHeight {
+            pendingSelectedDisplayResize = FramebufferRect(
+                x: 0, y: 0, width: target.width, height: target.height,
+                encoding: .desktopSize)
+        }
+        var payload = appleSetDisplayMessage(
+            isGlobal: id == nil,
+            displayID: id ?? 0)
+        // 帧缓冲要等下一批更新才换尺寸，这条请求直接按目标尺寸发。
+        payload.append(ClientMessage.framebufferUpdateRequest(
+            incremental: false,
+            x: 0, y: 0,
+            width: target.width,
+            height: target.height
+        ).serialize())
         do {
-            try await sendClientPayload(appleSetDisplayMessage(
-                isGlobal: id == nil,
-                displayID: id ?? 0))
+            try await sendClientPayload(payload)
+            framebufferRequestSentNanos = DispatchTime.now().uptimeNanoseconds
+            log.info("Reselected Apple display, framebuffer target \(target.width)x\(target.height)")
             return true
         } catch {
             log.warning(
@@ -3396,6 +3426,29 @@ public actor TransportSession {
                     + error.localizedDescription)
             return false
         }
+    }
+
+    /// 选中显示器的尺寸；`nil` 是全部显示器的外接矩形。算不出来时保持当前尺寸。
+    private func standardSelectionGeometry(id: UInt32?) -> (width: UInt16, height: UInt16) {
+        let current = (width: fbWidth, height: fbHeight)
+        let chosen = standardAnnouncedDisplays.filter {
+            $0.width > 0 && $0.height > 0 && (id == nil || $0.displayIndex == id)
+        }
+        guard let first = chosen.first else { return current }
+        var minX = Int64(first.originX)
+        var minY = Int64(first.originY)
+        var maxX = minX + Int64(first.width)
+        var maxY = minY + Int64(first.height)
+        for display in chosen.dropFirst() {
+            minX = min(minX, Int64(display.originX))
+            minY = min(minY, Int64(display.originY))
+            maxX = max(maxX, Int64(display.originX) + Int64(display.width))
+            maxY = max(maxY, Int64(display.originY) + Int64(display.height))
+        }
+        guard maxX - minX <= Int64(UInt16.max), maxY - minY <= Int64(UInt16.max) else {
+            return current
+        }
+        return (UInt16(maxX - minX), UInt16(maxY - minY))
     }
 
     private func sendAppleStandardDisplaySelectionIfNeeded(

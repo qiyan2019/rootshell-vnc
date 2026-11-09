@@ -1929,6 +1929,79 @@ final class TransportSessionScriptedTests: XCTestCase {
         await session.disconnect()
     }
 
+    /// 切换后服务端按新显示器尺寸编码且清了缓存：帧缓冲要先换尺寸，再要一张整帧。
+    func testReselectingDisplayAdoptsGeometryAndRequestsFullFrame() async throws {
+        let firstID: UInt32 = 1
+        let secondID: UInt32 = 3
+        let displays = [
+            AppleDisplayInfo(
+                displayIndex: firstID, originX: 4, originY: 0,
+                width: 2, height: 1, flags: 0),
+            AppleDisplayInfo(
+                displayIndex: secondID, originX: 0, originY: 0,
+                width: 4, height: 2, flags: 0),
+        ]
+        let connection = ScriptedRFBConnection()
+        var script = ProtocolVersion.apple.wireBytes()
+        script.append(contentsOf: [1, SecurityType.none.rawValue])
+        script.append(contentsOf: [0, 0, 0, 0])
+        script.append(Self.serverInitMessage(
+            width: 6, height: 2, name: "apple-reselect-geometry"))
+        script.append(Self.framebufferUpdate([(
+            Self.rectangleHeader(
+                x: 0, y: 0, width: 0, height: 0, encoding: 1105),
+            appleDisplayInfo2TestPayload(displays: displays)
+        )]))
+        await connection.enqueueServerBytes(script)
+
+        let session = TransportSession(
+            host: "apple-reselect-geometry.test",
+            port: 5900,
+            password: "",
+            preferredEncodings: Self.appleDCTEncodings,
+            displayCount: 1,
+            connection: connection)
+        let updates = Task { () -> [[FramebufferRect]] in
+            var seen: [[FramebufferRect]] = []
+            for await event in session.events {
+                if case .framebufferUpdate(let rects) = event {
+                    seen.append(rects.map(\.0))
+                    if seen.count == 2 { break }
+                }
+            }
+            return seen
+        }
+        try await session.connect()
+        try await Task.sleep(for: .milliseconds(200))
+
+        let selected = await session.selectStandardRemoteDisplay(id: secondID)
+        XCTAssertTrue(selected)
+        var expected = Self.setDisplayMessage(id: secondID)
+        expected.append(Data([0x03, 0x00, 0, 0, 0, 0, 0, 4, 0, 2]))
+        let sent = await connection.sentBytes()
+        XCTAssertEqual(
+            Self.occurrenceCount(of: expected, in: sent), 1,
+            "SetDisplay 后要紧跟按新尺寸的非增量请求")
+
+        await connection.enqueueServerBytes(Self.framebufferUpdate([(
+            Self.rectangleHeader(x: 0, y: 0, width: 1, height: 1, encoding: 0),
+            Data([1, 2, 3, 4])
+        )]))
+        let seen = await Self.withTimeout(seconds: 2) { await updates.value }
+        let rects = try XCTUnwrap(seen?.last)
+        XCTAssertEqual(rects.first?.encoding, .desktopSize, "换尺寸要排在像素前面")
+        XCTAssertEqual(rects.first?.width, 4)
+        XCTAssertEqual(rects.first?.height, 2)
+
+        var global = Data([0x0d, 0x01, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff])
+        global.append(Data([0x03, 0x00, 0, 0, 0, 0, 0, 6, 0, 2]))
+        let combined = await session.selectStandardRemoteDisplay(id: nil)
+        XCTAssertTrue(combined)
+        let after = await connection.sentBytes()
+        XCTAssertEqual(Self.occurrenceCount(of: global, in: after), 1, "全部显示器按并集尺寸请求")
+        await session.disconnect()
+    }
+
     func testSelectRemoteDisplaySendsNothingWithoutADisplayList() async throws {
         let connection = ScriptedRFBConnection()
         var script = ProtocolVersion.apple.wireBytes()
