@@ -80,6 +80,8 @@ public struct RemoteDesktopView: View {
     private let externalPointerMode: Binding<RemotePointerMode>?
     /// 相对适配比例放大时为 true，回到适配时为 false。只在翻转时调用。
     private let onViewportZoomChange: (@MainActor (Bool) -> Void)?
+    /// 宿主发起的「适配屏幕」：值每变一次就把缩放平移复位到看全整个桌面（同内置 HUD 的 Fit Screen）。
+    private let viewportResetRequest: Int
     /// 非 nil 时，手动的登录密码请求交给宿主，自动 pending 不再被视图消费。
     private let onLoginPasswordRequest: (@MainActor () -> Void)?
     private let pointerSpeed: Double
@@ -116,6 +118,7 @@ public struct RemoteDesktopView: View {
         showsBuiltInControls: Bool = true,
         pointerMode: Binding<RemotePointerMode>? = nil,
         onViewportZoomChange: (@MainActor (Bool) -> Void)? = nil,
+        viewportResetRequest: Int = 0,
         onLoginPasswordRequest: (@MainActor () -> Void)? = nil,
         scrollTuning: RemoteScrollTuning = .default
     ) {
@@ -136,6 +139,7 @@ public struct RemoteDesktopView: View {
             showsBuiltInControls: showsBuiltInControls,
             pointerMode: pointerMode,
             onViewportZoomChange: onViewportZoomChange,
+            viewportResetRequest: viewportResetRequest,
             onLoginPasswordRequest: onLoginPasswordRequest,
             scrollTuning: scrollTuning,
             hudMenuExtras: nil)
@@ -164,6 +168,7 @@ public struct RemoteDesktopView: View {
         showsBuiltInControls: Bool = true,
         pointerMode: Binding<RemotePointerMode>? = nil,
         onViewportZoomChange: (@MainActor (Bool) -> Void)? = nil,
+        viewportResetRequest: Int = 0,
         onLoginPasswordRequest: (@MainActor () -> Void)? = nil,
         scrollTuning: RemoteScrollTuning = .default,
         @ViewBuilder hudMenuExtras: () -> MenuExtras
@@ -185,6 +190,7 @@ public struct RemoteDesktopView: View {
             showsBuiltInControls: showsBuiltInControls,
             pointerMode: pointerMode,
             onViewportZoomChange: onViewportZoomChange,
+            viewportResetRequest: viewportResetRequest,
             onLoginPasswordRequest: onLoginPasswordRequest,
             scrollTuning: scrollTuning,
             hudMenuExtras: AnyView(hudMenuExtras()))
@@ -207,6 +213,7 @@ public struct RemoteDesktopView: View {
         showsBuiltInControls: Bool,
         pointerMode: Binding<RemotePointerMode>?,
         onViewportZoomChange: (@MainActor (Bool) -> Void)?,
+        viewportResetRequest: Int,
         onLoginPasswordRequest: (@MainActor () -> Void)?,
         scrollTuning: RemoteScrollTuning,
         hudMenuExtras: AnyView?
@@ -217,6 +224,7 @@ public struct RemoteDesktopView: View {
         self.showsBuiltInControls = showsBuiltInControls
         self.externalPointerMode = pointerMode
         self.onViewportZoomChange = onViewportZoomChange
+        self.viewportResetRequest = viewportResetRequest
         self.onLoginPasswordRequest = onLoginPasswordRequest
         self._viewportPanningMode = State(initialValue: initialViewportPanningMode)
         self._pointerMode = State(initialValue: initialPointerMode)
@@ -405,6 +413,9 @@ public struct RemoteDesktopView: View {
         }
         .onChange(of: viewport.scale) { _, scale in
             reportViewportZoom(scale)
+        }
+        .onChange(of: viewportResetRequest) { _, _ in
+            viewport.reset()
         }
         #if canImport(UIKit)
         .background {
